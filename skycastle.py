@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""SkyCastle (FeatherPanel) auto-renew + AFK / mobile credits farmer.
+"""SkyCastle (FeatherPanel) auto-renew + AFK credits farmer.
 
 Designed to run on GitHub Actions. Stdlib only.
+Default AFK is limited to 10 ticks to keep runs short.
 
 Login:
   PUT  /api/user/auth/login          {username_or_email, password, turnstile_token?}
@@ -731,13 +732,12 @@ def run_account(account: dict[str, str], mode: str, minutes: int, panel: str, ca
         summary["renew"] = run_renew(client, account)
 
     if mode in {"all", "afk"}:
-        afk_min = minutes if mode == "afk" else max(1, minutes // 2) if mode == "all" else minutes
-        summary["afk"] = run_afk(client, afk_min, "desktop")
+        # all / afk: only desktop AFK, limited to requested minutes (default 10)
+        summary["afk"] = run_afk(client, minutes, "desktop")
 
-    if mode in {"all", "mobile"}:
-        mob_min = minutes if mode == "mobile" else max(1, minutes - minutes // 2) if mode == "all" else minutes
-        # Sequential: BillingAFK last_seen is per-user, concurrent desktop+mobile 429s.
-        summary["mobile"] = run_afk(client, mob_min, "mobile")
+    if mode == "mobile":
+        # mobile mode kept for manual use only; not triggered by "all"
+        summary["mobile"] = run_afk(client, minutes, "mobile")
 
     if mode == "status":
         st = afk_status(client)
@@ -787,7 +787,7 @@ def main(argv: list[str] | None = None) -> int:
         default=env("SKYCASTLE_MODE") or "all",
         choices=["all", "login", "status", "afk", "mobile", "renew", "run"],
     )
-    parser.add_argument("--minutes", type=int, default=int(env("SKYCASTLE_AFK_MINUTES") or "240"))
+    parser.add_argument("--minutes", type=int, default=int(env("SKYCASTLE_AFK_MINUTES") or "10"))
     parser.add_argument("--panel", default=env("SKYCASTLE_PANEL") or PANEL_DEFAULT)
     parser.add_argument("--cache", default=env("SKYCASTLE_CACHE_DIR") or ".skycastle-cache")
     args = parser.parse_args(argv)

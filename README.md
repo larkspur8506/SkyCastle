@@ -1,6 +1,6 @@
 # CastleKeep · SkyCastle 自动续期
 
-完整 GitHub Actions 工作流：登录 [SkyCastle 面板](https://panel.skycastle.us)（FeatherPanel）、AFK 挂机赚 Credits、手机 Credits、用 Credits 保住套餐并拉起服务器。
+完整 GitHub Actions 工作流：登录 [SkyCastle 面板](https://panel.skycastle.us)（FeatherPanel）、桌面 AFK 挂机赚 Credits（默认只跑 10 次）、用 Credits 保住套餐并拉起服务器。
 
 面板真实接口（2026-09 对 `panel.skycastle.us` + FeatherPanel / BillingAFK / BillingPlans 源码核对）：
 
@@ -19,7 +19,7 @@
 
 BillingPlans **没有「立刻续期」按钮**。面板 cron 到期时用账户 Credits 自动续。本仓库的工作是：**挂机把 Credits 堆够 + 过期则重新 subscribe + 离线服务器开机**。
 
-BillingAFK 的 `last_seen_afk` 按用户锁 60 秒，所以 **桌面 AFK 和手机 Credits 不要同时跑**。三个 workflow 的 cron 已经错开。
+BillingAFK 的 `last_seen_afk` 按用户锁 60 秒。已移除独立的 mobile workflow，避免与桌面 AFK 抢锁导致 `RATE_LIMIT_EXCEEDED`。
 
 ## 1. 上传到 GitHub
 
@@ -59,11 +59,10 @@ BillingAFK 的 `last_seen_afk` 按用户锁 60 秒，所以 **桌面 AFK 和手�
 
 | 文件 | 默认节奏 | 做什么 |
 | --- | --- | --- |
-| `.github/workflows/skycastle.yml` | 每 6 小时 | 续期 + 桌面 AFK + 手机 Credits |
-| `.github/workflows/afk.yml` | 01/07/13/19 UTC | 只跑桌面 AFK，默认 300 分钟 |
-| `.github/workflows/mobile.yml` | 04/10/16/22 UTC | 只跑手机 UA 挂机 |
+| `.github/workflows/skycastle.yml` | 每 6 小时 | 续期 + 桌面 AFK（默认 10 次） |
+| `.github/workflows/afk.yml` | 01/07/13/19 UTC | 只跑桌面 AFK，默认 10 分钟 |
 
-GitHub 单 job 上限 6 小时，脚本把挂机封顶在 330 分钟。
+GitHub 单 job 上限 6 小时，脚本把挂机封顶在 330 分钟。默认 AFK 已压缩为 10 次，避免长时间占用和 rate limit。
 
 手动运行：Actions → SkyCastle Renew + AFK → Run workflow → 选 `status` 先确认登录。
 
@@ -78,12 +77,11 @@ export SKYCASTLE_TOTP='BASE32SECRET'
 
 python3 skycastle.py status
 python3 skycastle.py renew
-python3 skycastle.py afk --minutes 30
-python3 skycastle.py mobile --minutes 30
-python3 skycastle.py all --minutes 20
+python3 skycastle.py afk --minutes 10
+python3 skycastle.py all --minutes 10
 ```
 
-无第三方依赖（Python 3.10+）。
+无第三方依赖（Python 3.10+）。默认 `--minutes 10`。
 
 ## 5. 登录模式 / 续期模式（探测结果）
 
