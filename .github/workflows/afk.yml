@@ -2,14 +2,14 @@ name: SkyCastle AFK 挂机
 
 on:
   schedule:
-    # Offset from the main workflow so desktop + mobile don't collide on the 60s work lock.
+    # Offset from the main workflow so AFK doesn't collide on the 60s work lock.
     - cron: "50 1,7,13,19 * * *"
   workflow_dispatch:
     inputs:
       minutes:
-        description: "挂机分钟数"
+        description: "挂机分钟数（默认只跑10次）"
         required: false
-        default: "300"
+        default: "10"
 
 concurrency:
   group: skycastle-afk-${{ github.repository }}
@@ -45,7 +45,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           SKYCASTLE_MODE: afk
-          SKYCASTLE_AFK_MINUTES: ${{ github.event.inputs.minutes || '300' }}
+          SKYCASTLE_AFK_MINUTES: ${{ github.event.inputs.minutes || '10' }}
           PYTHONUNBUFFERED: "1"
         run: python -u skycastle.py afk
       - if: always()

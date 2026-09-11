@@ -7,15 +7,15 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "all = 续期 + 桌面 AFK + 手机 Credits；renew 只续期；afk 桌面挂机；mobile 手机挂机；status 只查询"
+        description: "all = 续期 + 桌面 AFK；renew 只续期；afk 桌面挂机；status 只查询"
         required: true
         default: all
         type: choice
-        options: [all, renew, afk, mobile, status, login]
+        options: [all, renew, afk, status, login]
       minutes:
-        description: "AFK 分钟数（GitHub 单次任务上限约 330）"
+        description: "AFK 分钟数（默认只跑10次）"
         required: false
-        default: "240"
+        default: "10"
       panel:
         description: "面板地址"
         required: false
@@ -67,7 +67,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           SKYCASTLE_MODE: ${{ github.event.inputs.mode || 'all' }}
-          SKYCASTLE_AFK_MINUTES: ${{ github.event.inputs.minutes || '240' }}
+          SKYCASTLE_AFK_MINUTES: ${{ github.event.inputs.minutes || '10' }}
           PYTHONUNBUFFERED: "1"
         run: python -u skycastle.py
 
