@@ -611,7 +611,13 @@ def sub_active(sub: dict[str, Any]) -> bool:
 def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
     credits = get_credits(client)
     log(f"credits balance = {credits}", "info")
-    report: dict[str, Any] = {"credits": credits, "subscriptions": [], "servers": [], "actions": []}
+    report: dict[str, Any] = {
+        "credits": credits,
+        "subscriptions": [],
+        "plans": [],
+        "servers": [],
+        "actions": [],
+    }
 
     try:
         subs, sub_credits = list_subscriptions(client)
@@ -620,12 +626,27 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
             report["credits"] = credits
         if not subs:
             log("no billing plan subscriptions on this account", "warn")
+            # 列出可用套餐，方便配置 SKYCASTLE_PLAN_ID
+            try:
+                plans = list_plans(client)
+                report["plans"] = [
+                    {
+                        "id": p.get("id"),
+                        "name": p.get("name") or p.get("plan_name"),
+                        "price": p.get("price_credits") or p.get("credits") or p.get("price"),
+                    }
+                    for p in plans[:20]
+                ]
+                for p in report["plans"]:
+                    log(f"available plan id={p.get('id')} · {p.get('name')} · price={p.get('price')}", "info")
+            except Exception as exc:  # noqa: BLE001
+                log(f"list plans: {exc}", "warn")
         for sub in subs:
             name = sub.get("plan_name") or sub.get("name") or f"plan#{sub.get('plan_id')}"
             status = sub.get("status")
             nxt = sub.get("next_renewal_at") or sub.get("expires_at")
             cost = sub.get("total_credits") or sub.get("price_credits") or sub.get("credits")
-            row = {"name": name, "status": status, "next_renewal_at": nxt, "cost": cost, "id": sub.get("id")}
+            row = {"name": name, "status": status, "next_renewal_at": nxt, "cost": cost, "id": sub.get("id"), "plan_id": sub.get("plan_id")}
             report["subscriptions"].append(row)
             log(f"sub {name} · status={status} · next={nxt} · cost={cost}", "info")
             if not sub_active(sub) and account.get("plan_id"):
@@ -648,11 +669,28 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
         log(f"subscriptions: {exc} ({exc.code})", "warn")
         report["actions"].append(f"subscriptions error: {exc}")
 
+    # 没有订阅且配置了 plan_id → 主动订阅
     if account.get("plan_id") and not report["subscriptions"]:
         try:
             subscribe(client, int(account["plan_id"]), env("SKYCASTLE_COUPON"))
             report["actions"].append(f"subscribed plan {account['plan_id']}")
             log(f"subscribed plan {account['plan_id']}", "ok")
+            # 重新拉一次订阅确认
+            try:
+                subs, _ = list_subscriptions(client)
+                for sub in subs:
+                    name = sub.get("plan_name") or sub.get("name") or f"plan#{sub.get('plan_id')}"
+                    report["subscriptions"].append(
+                        {
+                            "name": name,
+                            "status": sub.get("status"),
+                            "next_renewal_at": sub.get("next_renewal_at") or sub.get("expires_at"),
+                            "cost": sub.get("total_credits") or sub.get("price_credits"),
+                            "id": sub.get("id"),
+                        }
+                    )
+            except ApiError:
+                pass
         except ApiError as exc:
             report["actions"].append(f"subscribe failed: {exc}")
             log(f"subscribe failed: {exc}", "err")
@@ -686,25 +724,275 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# notify
+# notify + status card (screenshot-style summary)
 # ---------------------------------------------------------------------------
 
-def notify(text: str) -> None:
+def _html_escape(s: str) -> str:
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def format_report(results: list[dict[str, Any]]) -> str:
+    """Plain-text report for logs / Discord."""
+    lines = ["CastleKeep · SkyCastle 续期报告", time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()), ""]
+    for item in results:
+        lines.append(f"账号 {item.get('account')}  mode={item.get('mode')}")
+        renew = item.get("renew") or {}
+        if renew:
+            lines.append(f"  Credits: {renew.get('credits')}")
+            for sub in renew.get("subscriptions") or []:
+                lines.append(
+                    f"  套餐 {sub.get('name')}  {sub.get('status')}  next={sub.get('next_renewal_at')}"
+                )
+            if not renew.get("subscriptions") and renew.get("plans"):
+                lines.append("  (无订阅) 可用套餐:")
+                for p in renew["plans"][:5]:
+                    lines.append(f"    id={p.get('id')} {p.get('name')} price={p.get('price')}")
+            for srv in renew.get("servers") or []:
+                lines.append(f"  服务器 {srv.get('name')}  {srv.get('state')}")
+            for act in renew.get("actions") or []:
+                lines.append(f"  动作: {act}")
+        for key in ("afk", "mobile"):
+            block = item.get(key)
+            if block:
+                lines.append(
+                    f"  {key}: +{block.get('delta')} credits  "
+                    f"{block.get('credits_before')}→{block.get('credits_after')}  "
+                    f"{block.get('minutes')} min"
+                )
+        if item.get("error"):
+            lines.append(f"  ERROR: {item['error']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def format_report_html(results: list[dict[str, Any]]) -> str:
+    """Telegram HTML status card (acts as a readable screenshot)."""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+    parts = [
+        "<b>🏰 CastleKeep · SkyCastle</b>",
+        f"<code>{_html_escape(ts)}</code>",
+        "",
+    ]
+    for item in results:
+        acc = _html_escape(str(item.get("account") or "?"))
+        mode = _html_escape(str(item.get("mode") or ""))
+        parts.append(f"<b>账号</b> <code>{acc}</code> · <i>{mode}</i>")
+        if item.get("error"):
+            parts.append(f"❌ <b>ERROR</b> {_html_escape(item['error'])}")
+            parts.append("")
+            continue
+        renew = item.get("renew") or {}
+        if renew:
+            credits = renew.get("credits")
+            parts.append(f"💰 Credits: <b>{credits}</b>")
+            subs = renew.get("subscriptions") or []
+            if subs:
+                for sub in subs:
+                    name = _html_escape(str(sub.get("name") or "?"))
+                    st = _html_escape(str(sub.get("status") or "?"))
+                    nxt = _html_escape(str(sub.get("next_renewal_at") or "-"))
+                    parts.append(f"📦 套餐 <b>{name}</b> · {st}")
+                    parts.append(f"   下次续期: <code>{nxt}</code>")
+            else:
+                parts.append("📦 套餐: <i>无订阅</i>")
+                for p in (renew.get("plans") or [])[:3]:
+                    parts.append(
+                        f"   可选 id=<code>{p.get('id')}</code> "
+                        f"{_html_escape(str(p.get('name') or ''))} "
+                        f"price={p.get('price')}"
+                    )
+            for srv in renew.get("servers") or []:
+                name = _html_escape(str(srv.get("name") or "?"))
+                st = _html_escape(str(srv.get("state") or "unknown"))
+                icon = "🟢" if st in {"running", "online", "started"} else "🔴"
+                parts.append(f"{icon} 服务器 <b>{name}</b> · <code>{st}</code>")
+            for act in renew.get("actions") or []:
+                parts.append(f"⚡ {_html_escape(act)}")
+        for key in ("afk", "mobile"):
+            block = item.get(key)
+            if block:
+                delta = block.get("delta")
+                before = block.get("credits_before")
+                after = block.get("credits_after")
+                mins = block.get("minutes")
+                parts.append(
+                    f"⏱ {key.upper()}: <b>+{delta}</b> credits "
+                    f"(<code>{before}→{after}</code>) · {mins} min"
+                )
+        parts.append("")
+    parts.append("<i>自动续期 + AFK 完成</i>")
+    return "\n".join(parts)
+
+
+def _tg_api(token: str, method: str, fields: dict[str, Any], files: dict[str, tuple[str, bytes]] | None = None) -> None:
+    """Call Telegram Bot API. files = {field: (filename, content_bytes)}."""
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    if not files:
+        body = urllib.parse.urlencode({k: v for k, v in fields.items() if v is not None}).encode()
+        req = urllib.request.Request(url, data=body, method="POST")
+        urllib.request.urlopen(req, timeout=30).read()
+        return
+    # multipart/form-data for photo/document
+    boundary = f"----CastleKeep{int(time.time())}"
+    chunks: list[bytes] = []
+    for k, v in fields.items():
+        if v is None:
+            continue
+        chunks.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode())
+    for name, (filename, content) in files.items():
+        chunks.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                f"Content-Type: application/octet-stream\r\n\r\n"
+            ).encode()
+            + content
+            + b"\r\n"
+        )
+    chunks.append(f"--{boundary}--\r\n".encode())
+    data = b"".join(chunks)
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    urllib.request.urlopen(req, timeout=45).read()
+
+
+def build_status_png(results: list[dict[str, Any]], width: int = 720, height: int = 360) -> bytes:
+    """Minimal pure-stdlib status card PNG (solid bg + simple bars, no font needed).
+    Acts as a visual 'screenshot' for Telegram. Text details go in the caption.
+    """
+    import zlib
+
+    # Dark card background + accent bar
+    bg = (22, 27, 34)  # near GitHub dark
+    accent = (63, 185, 80)  # green success
+    warn = (210, 153, 34)
+    err = (248, 81, 73)
+    muted = (48, 54, 61)
+
+    pixels = bytearray()
+    has_error = any(item.get("error") for item in results)
+    top_color = err if has_error else accent
+
+    for y in range(height):
+        for x in range(width):
+            if y < 8:
+                r, g, b = top_color
+            elif y < 10:
+                r, g, b = muted
+            else:
+                r, g, b = bg
+            # left accent strip
+            if x < 6:
+                r, g, b = top_color
+            # bottom progress-style bar representing AFK delta
+            if y > height - 14:
+                r, g, b = muted
+                total_delta = 0
+                for item in results:
+                    for key in ("afk", "mobile"):
+                        block = item.get(key) or {}
+                        total_delta += int(block.get("delta") or 0)
+                # scale bar: each credit ~ 40px, capped
+                bar_w = min(width - 20, max(0, total_delta) * 40 + 20)
+                if 10 <= x < 10 + bar_w:
+                    r, g, b = accent if not has_error else warn
+            pixels.extend((r, g, b))
+
+    # PNG encode (RGB, no filter sophistication)
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    raw = b"".join(b"\x00" + pixels[i : i + width * 3] for i in range(0, len(pixels), width * 3))
+    compressed = zlib.compress(raw, 9)
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", compressed)
+    png += chunk(b"IEND", b"")
+    return png
+
+
+def notify(text: str, results: list[dict[str, Any]] | None = None, cache_dir: str = ".skycastle-cache") -> None:
     token = env("TELEGRAM_BOT_TOKEN") or env("TELEGRAM_TOKEN")
     chat = env("TELEGRAM_CHAT_ID") or env("TELEGRAM_CHAT")
+    results = results or []
+
     if token and chat:
-        body = urllib.parse.urlencode(
-            {"chat_id": chat, "text": text[:3900], "disable_web_page_preview": "true"}
-        ).encode()
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data=body,
-            method="POST",
-        )
+        html = format_report_html(results) if results else _html_escape(text)
+        # 1) HTML 状态卡片
         try:
-            urllib.request.urlopen(req, timeout=20).read()
+            _tg_api(
+                token,
+                "sendMessage",
+                {
+                    "chat_id": chat,
+                    "text": html[:3900],
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": "true",
+                },
+            )
+            log("telegram HTML status sent", "ok")
         except Exception as exc:  # noqa: BLE001
-            log(f"telegram notify failed: {exc}", "warn")
+            log(f"telegram HTML notify failed: {exc}", "warn")
+            # fallback plain
+            try:
+                _tg_api(
+                    token,
+                    "sendMessage",
+                    {"chat_id": chat, "text": text[:3900], "disable_web_page_preview": "true"},
+                )
+            except Exception as exc2:  # noqa: BLE001
+                log(f"telegram plain notify failed: {exc2}", "warn")
+
+        # 2) 状态截图 (PNG 卡片) + caption
+        if env("SKYCASTLE_TG_SCREENSHOT", "1") not in {"0", "false", "no"} and results:
+            try:
+                png = build_status_png(results)
+                os.makedirs(cache_dir, exist_ok=True)
+                png_path = os.path.join(cache_dir, "status-card.png")
+                with open(png_path, "wb") as fh:
+                    fh.write(png)
+                caption = "CastleKeep status card"
+                for item in results:
+                    renew = item.get("renew") or {}
+                    afk = item.get("afk") or {}
+                    caption = (
+                        f"Credits {renew.get('credits', '?')} · "
+                        f"AFK +{afk.get('delta', 0)} · "
+                        f"{time.strftime('%H:%M UTC', time.gmtime())}"
+                    )
+                    break
+                _tg_api(
+                    token,
+                    "sendPhoto",
+                    {"chat_id": chat, "caption": caption[:900]},
+                    files={"photo": ("status-card.png", png)},
+                )
+                log("telegram status screenshot sent", "ok")
+            except Exception as exc:  # noqa: BLE001
+                log(f"telegram screenshot failed: {exc}", "warn")
+
+        # 3) 可选：附带 JSON 报告文件
+        if env("SKYCASTLE_TG_DOCUMENT", "0") in {"1", "true", "yes"} and results:
+            try:
+                raw = json.dumps(results, ensure_ascii=False, indent=2).encode("utf-8")
+                _tg_api(
+                    token,
+                    "sendDocument",
+                    {"chat_id": chat, "caption": "last-report.json"},
+                    files={"document": ("last-report.json", raw)},
+                )
+            except Exception as exc:  # noqa: BLE001
+                log(f"telegram document failed: {exc}", "warn")
+
     hook = env("DISCORD_WEBHOOK")
     if hook:
         raw = json.dumps({"content": text[:1900]}).encode()
@@ -750,33 +1038,6 @@ def run_account(account: dict[str, str], mode: str, minutes: int, panel: str, ca
         log(json.dumps(summary["afk_status"], ensure_ascii=False), "info")
 
     return summary
-
-
-def format_report(results: list[dict[str, Any]]) -> str:
-    lines = ["CastleKeep · SkyCastle 续期报告", time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()), ""]
-    for item in results:
-        lines.append(f"账号 {item.get('account')}  mode={item.get('mode')}")
-        renew = item.get("renew") or {}
-        if renew:
-            lines.append(f"  Credits: {renew.get('credits')}")
-            for sub in renew.get("subscriptions") or []:
-                lines.append(f"  套餐 {sub.get('name')}  {sub.get('status')}  next={sub.get('next_renewal_at')}")
-            for srv in renew.get("servers") or []:
-                lines.append(f"  服务器 {srv.get('name')}  {srv.get('state')}")
-            for act in renew.get("actions") or []:
-                lines.append(f"  动作: {act}")
-        for key in ("afk", "mobile"):
-            block = item.get(key)
-            if block:
-                lines.append(
-                    f"  {key}: +{block.get('delta')} credits  "
-                    f"{block.get('credits_before')}→{block.get('credits_after')}  "
-                    f"{block.get('minutes')} min"
-                )
-        if item.get("error"):
-            lines.append(f"  ERROR: {item['error']}")
-        lines.append("")
-    return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -827,7 +1088,7 @@ def main(argv: list[str] | None = None) -> int:
 
     report = format_report(results)
     print("\n" + report, flush=True)
-    notify(report)
+    notify(report, results=results, cache_dir=args.cache)
     out = os.path.join(args.cache, "last-report.json")
     os.makedirs(args.cache, exist_ok=True)
     with open(out, "w", encoding="utf-8") as fh:

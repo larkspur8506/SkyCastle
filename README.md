@@ -39,15 +39,35 @@ BillingAFK 的 `last_seen_afk` 按用户锁 60 秒。已移除独立的 mobile w
 | `SKYCASTLE_TOKEN` | 推荐 | 浏览器 Cookie `remember_token`，可跳过验证码 |
 | `SKYCASTLE_TOTP` | 开了 2FA 时 | 验证器 base32 密钥 |
 | `SKYCASTLE_ACCOUNTS` | 多账号 | JSON 数组，见 `accounts.example.json` |
-| `SKYCASTLE_PLAN_ID` | 可选 | 套餐过期时重新订阅的 plan id |
+| `SKYCASTLE_PLAN_ID` | 可选 | 无订阅或过期时重新订阅的 plan id（日志会打印可用套餐 id） |
 | `SKYCASTLE_PANEL` | 可选 | 默认 `https://panel.skycastle.us` |
 | `SKYCASTLE_START_SERVERS` | 可选 | `0` 关闭自动开机，默认开机 |
 | `CAPSOLVER_KEY` | 可选 | 登录遇到 Turnstile 时自动过码 |
 | `SKYCASTLE_TURNSTILE_SITEKEY` | 可选 | Turnstile site key |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | 可选 | 跑完推送 |
-| `DISCORD_WEBHOOK` | 可选 | 跑完推送 |
+| `TELEGRAM_BOT_TOKEN` | 可选 | Telegram Bot Token（@BotFather） |
+| `TELEGRAM_CHAT_ID` | 可选 | 接收通知的 chat id |
+| `DISCORD_WEBHOOK` | 可选 | Discord webhook |
+| `SKYCASTLE_TG_SCREENSHOT` | 可选 | 默认 `1`，向 TG 发送状态截图卡片；设 `0` 关闭 |
+| `SKYCASTLE_TG_DOCUMENT` | 可选 | 设 `1` 时额外发送 last-report.json 文件 |
 
 \* 若提供了有效的 `SKYCASTLE_TOKEN`，邮箱密码可以不填。
+
+### Telegram 通知（推荐）
+
+1. 找 [@BotFather](https://t.me/BotFather) 创建 bot，拿到 `TELEGRAM_BOT_TOKEN`
+2. 把 bot 拉进你的私聊或群，发任意消息
+3. 打开 `https://api.telegram.org/bot<TOKEN>/getUpdates` 查 `chat.id`，填到 `TELEGRAM_CHAT_ID`
+4. 跑完后会收到：
+   - HTML 格式状态卡片（Credits / 套餐 / 服务器 / AFK）
+   - 状态截图 PNG（可用 `SKYCASTLE_TG_SCREENSHOT=0` 关闭）
+
+### 续期流程说明
+
+1. 读 Credits、当前订阅、服务器列表
+2. **无订阅**时：打印可用套餐列表（方便你填 `SKYCASTLE_PLAN_ID`），若已配置 `SKYCASTLE_PLAN_ID` 则自动 `subscribe`
+3. **订阅已过期/非 active**：用原 plan_id 或 `SKYCASTLE_PLAN_ID` 重新订阅
+4. 离线服务器自动开机（可用 `SKYCASTLE_START_SERVERS=0` 关闭）
+5. 面板本身靠 Credits 在 cron 到期时自动扣费续期，本脚本负责「养 Credits + 补订阅 + 开机」
 
 ### 拿 `remember_token`（最稳，推荐）
 
