@@ -1,0 +1,9 @@
+[
+  {
+    "email": "you@example.com",
+    "password": "at-least-8-chars",
+    "totp": "",
+    "token": "",
+    "plan_id": ""
+  }
+]
