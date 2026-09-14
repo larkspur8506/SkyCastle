@@ -64,6 +64,30 @@ def log(msg: str, level: str = "info") -> None:
     print(line, flush=True)
 
 
+def _looks_like_waf_html(raw: str) -> bool:
+    """Detect CrowdSec / Cloudflare / generic HTML challenge pages."""
+    s = (raw or "")[:4000].lower()
+    if not s:
+        return False
+    markers = (
+        "crowdsec",
+        "captcha",
+        "cf-browser-verification",
+        "attention required",
+        "access denied",
+        "you have been blocked",
+        "sorry, you have been blocked",
+        "<!doctype html",
+        "<html",
+    )
+    if any(m in s for m in markers[:7]):
+        return True
+    # HTML without JSON structure
+    if ("<!doctype html" in s or "<html" in s) and "{" not in s[:200]:
+        return True
+    return False
+
+
 def totp(secret: str, for_time: float | None = None) -> str:
     cleaned = secret.upper().replace(" ", "").replace("-", "")
     pad = "=" * ((8 - len(cleaned) % 8) % 8)
@@ -221,16 +245,33 @@ class PanelClient:
                     try:
                         payload = json.loads(raw)
                     except json.JSONDecodeError:
-                        return {"success": True, "data": raw, "status": resp.status, "raw": True}
+                        # CrowdSec / WAF / HTML challenge page
+                        if _looks_like_waf_html(raw):
+                            raise ApiError(
+                                "WAF/CrowdSec blocked this IP (HTML ban page). "
+                                "Reduce request rate or whitelist GitHub Actions.",
+                                "WAF_BLOCKED",
+                                resp.status,
+                            )
+                        return {"success": True, "data": raw[:200], "status": resp.status, "raw": True}
                     if isinstance(payload, dict):
                         payload.setdefault("status", resp.status)
                     return payload
             except urllib.error.HTTPError as exc:
                 raw = exc.read().decode("utf-8", "replace")
+                if _looks_like_waf_html(raw):
+                    msg = (
+                        f"WAF/CrowdSec ban (HTTP {exc.code}). "
+                        "Too many API probes or GHA IP blocked."
+                    )
+                    log(f"{method} {path} → {msg}", "err")
+                    raise ApiError(msg, "WAF_BLOCKED", exc.code) from exc
                 try:
                     payload = json.loads(raw) if raw else {}
                 except json.JSONDecodeError:
-                    payload = {"message": raw}
+                    # never put full HTML into error message
+                    snippet = raw.strip().replace("\n", " ")[:120]
+                    payload = {"message": snippet or f"HTTP {exc.code}"}
                 code = str(payload.get("error_code") or payload.get("code") or "")
                 msg = str(
                     payload.get("message")
@@ -238,8 +279,11 @@ class PanelClient:
                     or exc.reason
                     or f"HTTP {exc.code}"
                 )
+                # clamp message length for TG / logs
+                if len(msg) > 180:
+                    msg = msg[:177] + "..."
                 if exc.code in (429, 502, 503, 504) and attempt < retries:
-                    wait = min(30, 4 * attempt)
+                    wait = min(45, 6 * attempt)
                     if exc.code == 429:
                         wait = max(wait, WORK_MIN_INTERVAL)
                     log(f"{method} {path} → {exc.code}, retry in {wait}s ({code or msg})", "warn")
@@ -247,6 +291,8 @@ class PanelClient:
                     last_err = ApiError(msg, code, exc.code, payload)
                     continue
                 raise ApiError(msg, code, exc.code, payload) from exc
+            except ApiError:
+                raise
             except (urllib.error.URLError, TimeoutError, ssl.SSLError) as exc:
                 last_err = exc
                 wait = min(20, 3 * attempt)
@@ -658,13 +704,11 @@ def server_renewal_info(srv: dict[str, Any]) -> dict[str, Any]:
 
 
 def power_server(client: PanelClient, ident: str, action: str) -> bool:
-    """action: start | stop | restart"""
+    """action: start | stop | restart — minimal probes to avoid WAF."""
     action = action.lower().strip()
     paths_bodies: list[tuple[str, Any]] = [
         (f"/api/user/servers/{ident}/power/{action}", None),
         (f"/api/user/servers/{ident}/power", {"signal": action}),
-        (f"/api/client/servers/{ident}/power/{action}", None),
-        (f"/api/client/servers/{ident}/power", {"signal": action}),
     ]
     for path, body in paths_bodies:
         try:
@@ -672,7 +716,10 @@ def power_server(client: PanelClient, ident: str, action: str) -> bool:
             log(f"power {action} → {ident}", "ok")
             return True
         except ApiError as exc:
-            log(f"power {action} {ident} via {path}: {exc}", "warn")
+            if exc.code == "WAF_BLOCKED":
+                log(f"power {action} blocked by WAF", "err")
+                return False
+            log(f"power {action} {ident} via {path}: {str(exc)[:120]}", "warn")
     return False
 
 
@@ -709,32 +756,30 @@ def _is_missing_route(exc: ApiError) -> bool:
 def renew_server(client: PanelClient, ident: str, extra_ids: list[str] | None = None) -> dict[str, Any]:
     """Click the server RENEWAL button (costs credits, extends due date).
 
-    UI shows: RENEWAL · Due · N credits · in Xh
-    Probe common FeatherPanel / SkyCastle endpoints with uuidShort and full uuid.
+    Keep probes minimal — too many 404s trigger CrowdSec on panel.skycastle.us.
+    Override with SKYCASTLE_RENEW_PATH=/api/user/servers/{id}/renew
     """
     ids = [ident]
     for x in extra_ids or []:
         if x and x not in ids:
             ids.append(x)
 
+    custom = env("SKYCASTLE_RENEW_PATH")
     paths_bodies: list[tuple[str, Any]] = []
-    for i in ids:
-        paths_bodies.extend(
-            [
-                (f"/api/user/servers/{i}/renew", {}),
-                (f"/api/user/servers/{i}/renewal", {}),
-                (f"/api/user/servers/{i}/renew/credits", {}),
-                (f"/api/user/servers/{i}/billing/renew", {}),
-                (f"/api/user/servers/{i}/billing/renewal", {}),
-                (f"/api/client/servers/{i}/renew", {}),
-                (f"/api/client/servers/{i}/renewal", {}),
-                (f"/api/user/servers/{i}/extend", {}),
-                (f"/api/user/billing/servers/{i}/renew", {}),
-                (f"/api/user/billingcore/servers/{i}/renew", {}),
-                (f"/api/user/server/{i}/renew", {}),
-                # some panels use PUT
-            ]
-        )
+    if custom:
+        for i in ids:
+            p = custom.replace("{id}", i).replace("{uuid}", i).replace("{uuidShort}", i)
+            paths_bodies.append((p, {}))
+    else:
+        # only the most likely paths (max ~4 requests)
+        i = ids[0]
+        paths_bodies = [
+            (f"/api/user/servers/{i}/renew", {}),
+            (f"/api/client/servers/{i}/renew", {}),
+            (f"/api/user/servers/{i}/renewal", {}),
+        ]
+        if len(ids) > 1:
+            paths_bodies.append((f"/api/user/servers/{ids[1]}/renew", {}))
 
     last_err: Exception | None = None
     probed: list[str] = []
@@ -747,36 +792,33 @@ def renew_server(client: PanelClient, ident: str, extra_ids: list[str] | None = 
             return {"ok": True, "path": path, "data": data if isinstance(data, dict) else payload}
         except ApiError as exc:
             last_err = exc
+            if exc.code == "WAF_BLOCKED":
+                return {
+                    "ok": False,
+                    "path": path,
+                    "error": str(exc),
+                    "code": "WAF_BLOCKED",
+                    "probed": probed,
+                }
             if _is_missing_route(exc):
                 log(f"renew probe miss {path}", "info")
+                time.sleep(1.5)  # slow down to avoid CrowdSec
                 continue
             log(f"renew {ident} via {path}: {exc} [{exc.code}]", "warn")
-            # Insufficient credits / business error — stop probing this is the real route
             if exc.status in (400, 402, 403, 409, 422) or "credit" in str(exc).lower():
-                return {"ok": False, "path": path, "error": str(exc), "code": exc.code}
+                return {"ok": False, "path": path, "error": str(exc)[:180], "code": exc.code}
+            time.sleep(1.5)
             continue
 
-    # Also try PUT on primary paths once
-    for i in ids[:2]:
-        for path in (f"/api/user/servers/{i}/renew", f"/api/client/servers/{i}/renew"):
-            try:
-                payload = client.request("PUT", path, {}, retries=1)
-                log(f"server renew PUT → {ident} via {path}", "ok")
-                data = payload.get("data") if isinstance(payload, dict) else payload
-                return {"ok": True, "path": f"PUT {path}", "data": data if isinstance(data, dict) else payload}
-            except ApiError as exc:
-                last_err = exc
-                if _is_missing_route(exc):
-                    continue
-                if exc.status in (400, 402, 403, 409, 422):
-                    return {"ok": False, "path": f"PUT {path}", "error": str(exc), "code": exc.code}
-
+    err = str(last_err) if last_err else "no renew endpoint matched"
+    if len(err) > 180:
+        err = err[:177] + "..."
     return {
         "ok": False,
         "path": None,
-        "error": str(last_err) if last_err else "no renew endpoint matched",
+        "error": err,
         "code": getattr(last_err, "code", "") if last_err else "NO_ENDPOINT",
-        "probed": probed[:12],
+        "probed": probed,
     }
 
 
@@ -1051,7 +1093,13 @@ def format_report_html(results: list[dict[str, Any]]) -> str:
         mode = _html_escape(str(item.get("mode") or ""))
         parts.append(f"<b>账号</b> <code>{acc}</code> · <i>{mode}</i>")
         if item.get("error"):
-            parts.append(f"❌ <b>ERROR</b> {_html_escape(item['error'])}")
+            err = str(item["error"])
+            if len(err) > 200:
+                err = err[:197] + "..."
+            # never dump HTML ban pages into Telegram
+            if _looks_like_waf_html(err) or "<html" in err.lower():
+                err = "WAF/CrowdSec blocked API (IP banned or rate-limited)"
+            parts.append(f"❌ <b>ERROR</b> {_html_escape(err)}")
             parts.append("")
             continue
         renew = item.get("renew") or {}
