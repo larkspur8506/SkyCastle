@@ -695,23 +695,51 @@ def restart_server(client: PanelClient, ident: str) -> bool:
     return ok_stop and ok_start
 
 
-def renew_server(client: PanelClient, ident: str) -> dict[str, Any]:
+def _is_missing_route(exc: ApiError) -> bool:
+    msg = str(exc).lower()
+    return (
+        exc.status in (404, 405, 501)
+        or exc.code in {"NOT_FOUND", "METHOD_NOT_ALLOWED", "ROUTE_NOT_FOUND"}
+        or "route does not exist" in msg
+        or "not found" in msg
+        or "no route" in msg
+    )
+
+
+def renew_server(client: PanelClient, ident: str, extra_ids: list[str] | None = None) -> dict[str, Any]:
     """Click the server RENEWAL button (costs credits, extends due date).
 
     UI shows: RENEWAL · Due · N credits · in Xh
-    Probe common FeatherPanel / SkyCastle endpoints.
+    Probe common FeatherPanel / SkyCastle endpoints with uuidShort and full uuid.
     """
-    paths_bodies: list[tuple[str, Any]] = [
-        (f"/api/user/servers/{ident}/renew", {}),
-        (f"/api/user/servers/{ident}/renewal", {}),
-        (f"/api/user/servers/{ident}/billing/renew", {}),
-        (f"/api/client/servers/{ident}/renew", {}),
-        (f"/api/client/servers/{ident}/renewal", {}),
-        (f"/api/user/servers/{ident}/extend", {}),
-        (f"/api/user/billing/servers/{ident}/renew", {}),
-    ]
+    ids = [ident]
+    for x in extra_ids or []:
+        if x and x not in ids:
+            ids.append(x)
+
+    paths_bodies: list[tuple[str, Any]] = []
+    for i in ids:
+        paths_bodies.extend(
+            [
+                (f"/api/user/servers/{i}/renew", {}),
+                (f"/api/user/servers/{i}/renewal", {}),
+                (f"/api/user/servers/{i}/renew/credits", {}),
+                (f"/api/user/servers/{i}/billing/renew", {}),
+                (f"/api/user/servers/{i}/billing/renewal", {}),
+                (f"/api/client/servers/{i}/renew", {}),
+                (f"/api/client/servers/{i}/renewal", {}),
+                (f"/api/user/servers/{i}/extend", {}),
+                (f"/api/user/billing/servers/{i}/renew", {}),
+                (f"/api/user/billingcore/servers/{i}/renew", {}),
+                (f"/api/user/server/{i}/renew", {}),
+                # some panels use PUT
+            ]
+        )
+
     last_err: Exception | None = None
+    probed: list[str] = []
     for path, body in paths_bodies:
+        probed.append(path)
         try:
             payload = client.request("POST", path, body, retries=1)
             log(f"server renew → {ident} via {path}", "ok")
@@ -719,20 +747,36 @@ def renew_server(client: PanelClient, ident: str) -> dict[str, Any]:
             return {"ok": True, "path": path, "data": data if isinstance(data, dict) else payload}
         except ApiError as exc:
             last_err = exc
-            # 404/405 = wrong path; keep probing. Other errors may be real (insufficient credits).
-            if exc.status in (404, 405, 501) or exc.code in {"NOT_FOUND", "METHOD_NOT_ALLOWED"}:
-                log(f"renew probe {path}: {exc.status or exc.code}", "info")
+            if _is_missing_route(exc):
+                log(f"renew probe miss {path}", "info")
                 continue
             log(f"renew {ident} via {path}: {exc} [{exc.code}]", "warn")
-            # Insufficient credits etc. — stop probing
-            if exc.status in (400, 402, 403) or "credit" in str(exc).lower():
+            # Insufficient credits / business error — stop probing this is the real route
+            if exc.status in (400, 402, 403, 409, 422) or "credit" in str(exc).lower():
                 return {"ok": False, "path": path, "error": str(exc), "code": exc.code}
             continue
+
+    # Also try PUT on primary paths once
+    for i in ids[:2]:
+        for path in (f"/api/user/servers/{i}/renew", f"/api/client/servers/{i}/renew"):
+            try:
+                payload = client.request("PUT", path, {}, retries=1)
+                log(f"server renew PUT → {ident} via {path}", "ok")
+                data = payload.get("data") if isinstance(payload, dict) else payload
+                return {"ok": True, "path": f"PUT {path}", "data": data if isinstance(data, dict) else payload}
+            except ApiError as exc:
+                last_err = exc
+                if _is_missing_route(exc):
+                    continue
+                if exc.status in (400, 402, 403, 409, 422):
+                    return {"ok": False, "path": f"PUT {path}", "error": str(exc), "code": exc.code}
+
     return {
         "ok": False,
         "path": None,
         "error": str(last_err) if last_err else "no renew endpoint matched",
         "code": getattr(last_err, "code", "") if last_err else "NO_ENDPOINT",
+        "probed": probed[:12],
     }
 
 
@@ -788,18 +832,35 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
         log(f"subscriptions: {exc} ({exc.code})", "warn")
 
     do_renew = env("SKYCASTLE_SERVER_RENEW", "1") not in {"0", "false", "no"}
-    do_restart = env("SKYCASTLE_RESTART_SERVERS", "1") not in {"0", "false", "no"}
-    do_start = env("SKYCASTLE_START_SERVERS", "1") not in {"0", "false", "no"}
+    # 仅当状态为 offline / stopping 等异常时才 start/restart（避免打断正常 running）
+    do_power_fix = env("SKYCASTLE_START_SERVERS", "1") not in {"0", "false", "no"}
+    need_power_states = {
+        "offline",
+        "stopped",
+        "stopping",
+        "exited",
+        "suspended",
+        "dead",
+    }
 
     servers = list_servers(client)
     if not servers:
         log("no servers returned (ok if account is empty)", "info")
+    else:
+        # dump first server keys once — helps discover renewal field / id shape
+        try:
+            sample = servers[0]
+            log(f"server keys: {sorted(sample.keys()) if isinstance(sample, dict) else type(sample)}", "info")
+        except Exception:
+            pass
 
     for srv in servers:
         ident = server_ident(srv)
         name = server_name(srv)
         state = server_state(srv)
         ren_info = server_renewal_info(srv)
+        full_uuid = str(srv.get("uuid") or srv.get("uuidFull") or srv.get("server_uuid") or "")
+        extra_ids = [full_uuid] if full_uuid and full_uuid != ident else []
         row: dict[str, Any] = {
             "name": name,
             "id": ident,
@@ -821,7 +882,7 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
 
         # 1) 服务器卡片「续期」按钮
         if do_renew and ident:
-            result = renew_server(client, ident)
+            result = renew_server(client, ident, extra_ids=extra_ids)
             if result.get("ok"):
                 row["renewed"] = True
                 report["actions"].append(f"renew {name} ok via {result.get('path')}")
@@ -856,42 +917,39 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
                         "code": result.get("code"),
                         "due_before": row["renewal_due_before"],
                         "cost": row["renewal_cost"],
+                        "probed": result.get("probed"),
                     }
                 )
                 log(f"✗ 续期失败 {name}: {err}", "err")
 
-        # 2) 关机再重启（用户要求：关机 + 点击重启）
-        if do_restart and ident:
-            ok = restart_server(client, ident)
-            row["restarted"] = ok
-            if ok:
-                report["actions"].append(f"restart {name} ok")
-                report["restarts"].append({"name": name, "id": ident, "ok": True})
-                log(f"✓ 重启完成 {name}", "ok")
-                # 等几秒再读状态
-                time.sleep(2)
-            else:
-                row["errors"].append("restart failed")
-                report["actions"].append(f"restart {name} failed")
-                report["restarts"].append({"name": name, "id": ident, "ok": False})
-                log(f"✗ 重启失败 {name}", "err")
-        elif do_start and ident and state in {
-            "offline",
-            "stopped",
-            "stopping",
-            "exited",
-            "installing",
-            "suspended",
-            "",
-        }:
+        # 2) 仅 offline / stopping 等才启动或重启（running/starting 不动）
+        if do_power_fix and ident and state in need_power_states:
+            log(f"server {name} state={state} → need power recovery", "warn")
+            # stopping: 先等一下再 start；offline/stopped: 直接 start
+            if state == "stopping":
+                time.sleep(5)
             ok = start_server(client, ident)
-            row["started"] = ok
-            if ok:
-                report["actions"].append(f"start {name}")
-                log(f"✓ 开机 {name}", "ok")
+            if not ok:
+                # start 失败再试 restart
+                ok = restart_server(client, ident)
+                row["restarted"] = ok
+                if ok:
+                    report["actions"].append(f"restart {name} ok (was {state})")
+                    report["restarts"].append({"name": name, "id": ident, "ok": True, "reason": state})
+                    log(f"✓ 重启完成 {name} (was {state})", "ok")
+                else:
+                    row["errors"].append("start/restart failed")
+                    report["actions"].append(f"restart {name} failed (was {state})")
+                    report["restarts"].append({"name": name, "id": ident, "ok": False, "reason": state})
+                    log(f"✗ 重启失败 {name}", "err")
             else:
-                row["errors"].append("start failed")
-                report["actions"].append(f"start {name} failed")
+                row["started"] = True
+                report["actions"].append(f"start {name} ok (was {state})")
+                report["restarts"].append({"name": name, "id": ident, "ok": True, "action": "start", "reason": state})
+                log(f"✓ 开机 {name} (was {state})", "ok")
+            time.sleep(2)
+        elif ident:
+            log(f"server {name} state={state or 'unknown'} — skip power (only offline/stopping need it)", "info")
 
         report["servers"].append(row)
 
@@ -1113,23 +1171,24 @@ def capture_panel_screenshot(
     cache_dir: str,
     path: str = "/dashboard/servers",
     filename: str = "panel-servers.png",
-) -> str | None:
+) -> tuple[str | None, str]:
     """Real browser screenshot of the panel page (requires playwright + chromium).
 
-    Returns absolute path to PNG, or None if unavailable.
+    Returns (absolute path to PNG or None, status message).
     """
     if not remember_token:
-        log("screenshot skipped: no remember_token", "warn")
-        return None
+        msg = "screenshot skipped: no remember_token (set SKYCASTLE_TOKEN)"
+        log(msg, "warn")
+        return None, msg
     try:
         from playwright.sync_api import sync_playwright  # type: ignore
     except ImportError:
-        log(
+        msg = (
             "screenshot skipped: playwright not installed "
-            "(pip install playwright && playwright install chromium)",
-            "warn",
+            "(workflow should: pip install playwright && playwright install --with-deps chromium)"
         )
-        return None
+        log(msg, "warn")
+        return None, msg
 
     os.makedirs(cache_dir, exist_ok=True)
     out = os.path.abspath(os.path.join(cache_dir, filename))
@@ -1144,37 +1203,49 @@ def capture_panel_screenshot(
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
             )
             context = browser.new_context(
-                viewport={"width": 1280, "height": 900},
+                viewport={"width": 1400, "height": 1000},
                 user_agent=UA_DESKTOP,
                 locale="zh-CN",
+                color_scheme="dark",
             )
-            context.add_cookies(
-                [
+            # Cookie for both host and .host
+            cookies = []
+            for domain in {host, f".{host}"}:
+                cookies.append(
                     {
                         "name": "remember_token",
                         "value": remember_token,
-                        "domain": host,
+                        "domain": domain,
                         "path": "/",
                         "secure": True,
                         "httpOnly": True,
+                        "sameSite": "Lax",
                     }
-                ]
-            )
+                )
+            context.add_cookies(cookies)
             page = context.new_page()
-            page.goto(target, wait_until="networkidle", timeout=60000)
-            # SPA may still paint cards after networkidle
-            page.wait_for_timeout(2500)
-            # Prefer full page so RENEWAL / server cards are visible
+            # domcontentloaded is more reliable than networkidle on SPAs
+            page.goto(target, wait_until="domcontentloaded", timeout=90000)
+            page.wait_for_timeout(4000)
+            # If redirected to login, try once more after cookie settle
+            if "login" in (page.url or "").lower() or "auth" in (page.url or "").lower():
+                log(f"screenshot landed on auth page ({page.url}), retry…", "warn")
+                page.goto(target, wait_until="domcontentloaded", timeout=90000)
+                page.wait_for_timeout(4000)
             page.screenshot(path=out, full_page=True, type="png")
+            final_url = page.url
             browser.close()
-        if os.path.isfile(out) and os.path.getsize(out) > 1000:
-            log(f"panel screenshot saved → {out} ({os.path.getsize(out)} bytes)", "ok")
-            return out
-        log(f"screenshot file missing or too small: {out}", "warn")
-        return None
+        if os.path.isfile(out) and os.path.getsize(out) > 2000:
+            msg = f"panel screenshot ok → {out} ({os.path.getsize(out)} bytes) url={final_url}"
+            log(msg, "ok")
+            return out, msg
+        msg = f"screenshot file missing or too small: {out}"
+        log(msg, "warn")
+        return None, msg
     except Exception as exc:  # noqa: BLE001
-        log(f"playwright screenshot failed: {exc}", "warn")
-        return None
+        msg = f"playwright screenshot failed: {exc}"
+        log(msg, "warn")
+        return None, msg
 
 
 def notify(
@@ -1234,9 +1305,10 @@ def notify(
                     )
                     break
 
-                shot = capture_panel_screenshot(
+                rtoken = remember_token or env("SKYCASTLE_TOKEN") or env("SKYCASTLE_REMEMBER_TOKEN")
+                shot, shot_msg = capture_panel_screenshot(
                     panel=panel,
-                    remember_token=remember_token or env("SKYCASTLE_TOKEN") or env("SKYCASTLE_REMEMBER_TOKEN"),
+                    remember_token=rtoken,
                     cache_dir=cache_dir,
                     path=env("SKYCASTLE_SCREENSHOT_PATH") or "/dashboard/servers",
                     filename="panel-servers.png",
@@ -1252,7 +1324,21 @@ def notify(
                     )
                     log("telegram real panel screenshot sent", "ok")
                 else:
-                    log("real screenshot unavailable — HTML report only", "warn")
+                    # 明确告诉 TG 为什么没图
+                    try:
+                        _tg_api(
+                            token,
+                            "sendMessage",
+                            {
+                                "chat_id": chat,
+                                "text": f"⚠️ 面板截图失败\n{_html_escape(shot_msg)[:500]}",
+                                "parse_mode": "HTML",
+                                "disable_web_page_preview": "true",
+                            },
+                        )
+                    except Exception:
+                        pass
+                    log(f"real screenshot unavailable: {shot_msg}", "warn")
             except Exception as exc:  # noqa: BLE001
                 log(f"telegram screenshot failed: {exc}", "warn")
 
