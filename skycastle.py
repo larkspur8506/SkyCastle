@@ -589,18 +589,151 @@ def list_servers(client: PanelClient) -> list[dict[str, Any]]:
     return []
 
 
-def start_server(client: PanelClient, ident: str) -> None:
-    for path in (
-        f"/api/user/servers/{ident}/power/start",
-        f"/api/client/servers/{ident}/power",
-    ):
+def server_ident(srv: dict[str, Any]) -> str:
+    return str(
+        srv.get("uuidShort")
+        or srv.get("uuid_short")
+        or srv.get("identifier")
+        or srv.get("uuid")
+        or srv.get("id")
+        or ""
+    )
+
+
+def server_name(srv: dict[str, Any]) -> str:
+    return str(srv.get("name") or server_ident(srv) or "?")
+
+
+def server_state(srv: dict[str, Any]) -> str:
+    return str(
+        srv.get("status")
+        or (srv.get("state") if not isinstance(srv.get("state"), dict) else "")
+        or ((srv.get("attributes") or {}).get("status") if isinstance(srv.get("attributes"), dict) else "")
+        or ""
+    ).lower()
+
+
+def server_renewal_info(srv: dict[str, Any]) -> dict[str, Any]:
+    """Extract RENEWAL card fields shown on dashboard/servers."""
+    candidates = [
+        srv,
+        srv.get("renewal") if isinstance(srv.get("renewal"), dict) else None,
+        srv.get("billing") if isinstance(srv.get("billing"), dict) else None,
+        srv.get("attributes") if isinstance(srv.get("attributes"), dict) else None,
+        (srv.get("attributes") or {}).get("renewal")
+        if isinstance((srv.get("attributes") or {}).get("renewal"), dict)
+        else None,
+    ]
+    due = None
+    cost = None
+    period = None
+    for obj in candidates:
+        if not isinstance(obj, dict):
+            continue
+        for k in (
+            "renewal_due_at",
+            "due_at",
+            "expires_at",
+            "next_renewal_at",
+            "renewal_date",
+            "due",
+            "renews_at",
+        ):
+            if obj.get(k) is not None and due is None:
+                due = obj.get(k)
+        for k in (
+            "renewal_cost",
+            "renew_cost",
+            "renewal_credits",
+            "renew_credits",
+            "price_credits",
+            "credits",
+        ):
+            if obj.get(k) is not None and cost is None:
+                cost = obj.get(k)
+        for k in ("renewal_period", "period", "billing_period", "in"):
+            if obj.get(k) is not None and period is None:
+                period = obj.get(k)
+    return {"due": due, "cost": cost, "period": period}
+
+
+def power_server(client: PanelClient, ident: str, action: str) -> bool:
+    """action: start | stop | restart"""
+    action = action.lower().strip()
+    paths_bodies: list[tuple[str, Any]] = [
+        (f"/api/user/servers/{ident}/power/{action}", None),
+        (f"/api/user/servers/{ident}/power", {"signal": action}),
+        (f"/api/client/servers/{ident}/power/{action}", None),
+        (f"/api/client/servers/{ident}/power", {"signal": action}),
+    ]
+    for path, body in paths_bodies:
         try:
-            body = {"signal": "start"} if path.endswith("/power") else None
-            client.request("POST", path, body)
-            log(f"power start → {ident}", "ok")
-            return
+            client.request("POST", path, body, retries=2)
+            log(f"power {action} → {ident}", "ok")
+            return True
         except ApiError as exc:
-            log(f"start {ident} via {path}: {exc}", "warn")
+            log(f"power {action} {ident} via {path}: {exc}", "warn")
+    return False
+
+
+def start_server(client: PanelClient, ident: str) -> bool:
+    return power_server(client, ident, "start")
+
+
+def stop_server(client: PanelClient, ident: str) -> bool:
+    return power_server(client, ident, "stop")
+
+
+def restart_server(client: PanelClient, ident: str) -> bool:
+    # Prefer dedicated restart; fallback stop → wait → start
+    if power_server(client, ident, "restart"):
+        return True
+    log(f"restart fallback: stop→start for {ident}", "warn")
+    ok_stop = stop_server(client, ident)
+    time.sleep(3)
+    ok_start = start_server(client, ident)
+    return ok_stop and ok_start
+
+
+def renew_server(client: PanelClient, ident: str) -> dict[str, Any]:
+    """Click the server RENEWAL button (costs credits, extends due date).
+
+    UI shows: RENEWAL · Due · N credits · in Xh
+    Probe common FeatherPanel / SkyCastle endpoints.
+    """
+    paths_bodies: list[tuple[str, Any]] = [
+        (f"/api/user/servers/{ident}/renew", {}),
+        (f"/api/user/servers/{ident}/renewal", {}),
+        (f"/api/user/servers/{ident}/billing/renew", {}),
+        (f"/api/client/servers/{ident}/renew", {}),
+        (f"/api/client/servers/{ident}/renewal", {}),
+        (f"/api/user/servers/{ident}/extend", {}),
+        (f"/api/user/billing/servers/{ident}/renew", {}),
+    ]
+    last_err: Exception | None = None
+    for path, body in paths_bodies:
+        try:
+            payload = client.request("POST", path, body, retries=1)
+            log(f"server renew → {ident} via {path}", "ok")
+            data = payload.get("data") if isinstance(payload, dict) else payload
+            return {"ok": True, "path": path, "data": data if isinstance(data, dict) else payload}
+        except ApiError as exc:
+            last_err = exc
+            # 404/405 = wrong path; keep probing. Other errors may be real (insufficient credits).
+            if exc.status in (404, 405, 501) or exc.code in {"NOT_FOUND", "METHOD_NOT_ALLOWED"}:
+                log(f"renew probe {path}: {exc.status or exc.code}", "info")
+                continue
+            log(f"renew {ident} via {path}: {exc} [{exc.code}]", "warn")
+            # Insufficient credits etc. — stop probing
+            if exc.status in (400, 402, 403) or "credit" in str(exc).lower():
+                return {"ok": False, "path": path, "error": str(exc), "code": exc.code}
+            continue
+    return {
+        "ok": False,
+        "path": None,
+        "error": str(last_err) if last_err else "no renew endpoint matched",
+        "code": getattr(last_err, "code", "") if last_err else "NO_ENDPOINT",
+    }
 
 
 def sub_active(sub: dict[str, Any]) -> bool:
@@ -609,117 +742,185 @@ def sub_active(sub: dict[str, Any]) -> bool:
 
 
 def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
-    credits = get_credits(client)
-    log(f"credits balance = {credits}", "info")
+    """Server-card RENEWAL (manual 1-credit style) + optional restart/start.
+
+    Dashboard shows per-server:
+      RENEWAL · Due 9月17日 · 1 credits · in 36h
+    That is NOT BillingPlans auto-cron — must POST renew on the server.
+    """
+    credits_before = get_credits(client)
+    log(f"credits balance = {credits_before}", "info")
     report: dict[str, Any] = {
-        "credits": credits,
+        "credits_before": credits_before,
+        "credits": credits_before,
+        "credits_after": credits_before,
         "subscriptions": [],
         "plans": [],
         "servers": [],
+        "renewals": [],
+        "restarts": [],
         "actions": [],
     }
 
+    # Optional: still surface BillingPlans info (not the primary renew path)
     try:
         subs, sub_credits = list_subscriptions(client)
         if sub_credits:
-            credits = sub_credits
-            report["credits"] = credits
-        if not subs:
-            log("no billing plan subscriptions on this account", "warn")
-            # 列出可用套餐，方便配置 SKYCASTLE_PLAN_ID
-            try:
-                plans = list_plans(client)
-                report["plans"] = [
-                    {
-                        "id": p.get("id"),
-                        "name": p.get("name") or p.get("plan_name"),
-                        "price": p.get("price_credits") or p.get("credits") or p.get("price"),
-                    }
-                    for p in plans[:20]
-                ]
-                for p in report["plans"]:
-                    log(f"available plan id={p.get('id')} · {p.get('name')} · price={p.get('price')}", "info")
-            except Exception as exc:  # noqa: BLE001
-                log(f"list plans: {exc}", "warn")
+            report["credits"] = sub_credits
+            credits_before = sub_credits
+            report["credits_before"] = credits_before
         for sub in subs:
             name = sub.get("plan_name") or sub.get("name") or f"plan#{sub.get('plan_id')}"
             status = sub.get("status")
             nxt = sub.get("next_renewal_at") or sub.get("expires_at")
             cost = sub.get("total_credits") or sub.get("price_credits") or sub.get("credits")
-            row = {"name": name, "status": status, "next_renewal_at": nxt, "cost": cost, "id": sub.get("id"), "plan_id": sub.get("plan_id")}
+            row = {
+                "name": name,
+                "status": status,
+                "next_renewal_at": nxt,
+                "cost": cost,
+                "id": sub.get("id"),
+                "plan_id": sub.get("plan_id"),
+            }
             report["subscriptions"].append(row)
             log(f"sub {name} · status={status} · next={nxt} · cost={cost}", "info")
-            if not sub_active(sub) and account.get("plan_id"):
-                try:
-                    subscribe(client, int(account["plan_id"]), env("SKYCASTLE_COUPON"))
-                    report["actions"].append(f"resubscribed plan {account['plan_id']}")
-                    log(f"re-subscribed plan {account['plan_id']}", "ok")
-                except ApiError as exc:
-                    report["actions"].append(f"resubscribe failed: {exc}")
-                    log(f"resubscribe failed: {exc}", "err")
-            elif not sub_active(sub) and sub.get("plan_id"):
-                try:
-                    subscribe(client, int(sub["plan_id"]), env("SKYCASTLE_COUPON"))
-                    report["actions"].append(f"resubscribed plan {sub['plan_id']}")
-                    log(f"re-subscribed previous plan {sub['plan_id']}", "ok")
-                except ApiError as exc:
-                    report["actions"].append(f"resubscribe failed: {exc}")
-                    log(f"resubscribe failed: {exc} — farm more AFK credits", "warn")
     except ApiError as exc:
         log(f"subscriptions: {exc} ({exc.code})", "warn")
-        report["actions"].append(f"subscriptions error: {exc}")
 
-    # 没有订阅且配置了 plan_id → 主动订阅
-    if account.get("plan_id") and not report["subscriptions"]:
-        try:
-            subscribe(client, int(account["plan_id"]), env("SKYCASTLE_COUPON"))
-            report["actions"].append(f"subscribed plan {account['plan_id']}")
-            log(f"subscribed plan {account['plan_id']}", "ok")
-            # 重新拉一次订阅确认
-            try:
-                subs, _ = list_subscriptions(client)
-                for sub in subs:
-                    name = sub.get("plan_name") or sub.get("name") or f"plan#{sub.get('plan_id')}"
-                    report["subscriptions"].append(
-                        {
-                            "name": name,
-                            "status": sub.get("status"),
-                            "next_renewal_at": sub.get("next_renewal_at") or sub.get("expires_at"),
-                            "cost": sub.get("total_credits") or sub.get("price_credits"),
-                            "id": sub.get("id"),
-                        }
-                    )
-            except ApiError:
-                pass
-        except ApiError as exc:
-            report["actions"].append(f"subscribe failed: {exc}")
-            log(f"subscribe failed: {exc}", "err")
+    do_renew = env("SKYCASTLE_SERVER_RENEW", "1") not in {"0", "false", "no"}
+    do_restart = env("SKYCASTLE_RESTART_SERVERS", "1") not in {"0", "false", "no"}
+    do_start = env("SKYCASTLE_START_SERVERS", "1") not in {"0", "false", "no"}
 
-    if env("SKYCASTLE_START_SERVERS", "1") not in {"0", "false", "no"}:
-        servers = list_servers(client)
-        if not servers:
-            log("no servers returned (ok if account is empty)", "info")
-        for srv in servers:
-            ident = str(
-                srv.get("uuidShort")
-                or srv.get("uuid_short")
-                or srv.get("identifier")
-                or srv.get("uuid")
-                or srv.get("id")
-                or ""
-            )
-            name = srv.get("name") or ident
-            state = str(
-                srv.get("status")
-                or (srv.get("state") if not isinstance(srv.get("state"), dict) else "")
-                or ((srv.get("attributes") or {}).get("status") if isinstance(srv.get("attributes"), dict) else "")
-                or ""
-            ).lower()
-            report["servers"].append({"name": name, "id": ident, "state": state})
-            log(f"server {name} · {ident} · {state or 'unknown'}", "info")
-            if ident and state in {"offline", "stopped", "stopping", "exited", "installing", "suspended", ""}:
-                start_server(client, ident)
+    servers = list_servers(client)
+    if not servers:
+        log("no servers returned (ok if account is empty)", "info")
+
+    for srv in servers:
+        ident = server_ident(srv)
+        name = server_name(srv)
+        state = server_state(srv)
+        ren_info = server_renewal_info(srv)
+        row: dict[str, Any] = {
+            "name": name,
+            "id": ident,
+            "state_before": state,
+            "state_after": state,
+            "renewal_due_before": ren_info.get("due"),
+            "renewal_due_after": ren_info.get("due"),
+            "renewal_cost": ren_info.get("cost"),
+            "renewed": False,
+            "restarted": False,
+            "started": False,
+            "errors": [],
+        }
+        log(
+            f"server {name} · {ident} · state={state or 'unknown'} · "
+            f"due={ren_info.get('due')} · cost={ren_info.get('cost')}",
+            "info",
+        )
+
+        # 1) 服务器卡片「续期」按钮
+        if do_renew and ident:
+            result = renew_server(client, ident)
+            if result.get("ok"):
+                row["renewed"] = True
+                report["actions"].append(f"renew {name} ok via {result.get('path')}")
+                log(f"✓ 续期完成 {name}", "ok")
+                data = result.get("data") or {}
+                if isinstance(data, dict):
+                    for k in ("due_at", "expires_at", "next_renewal_at", "renewal_due_at", "due"):
+                        if data.get(k) is not None:
+                            row["renewal_due_after"] = data.get(k)
+                            break
+                report["renewals"].append(
+                    {
+                        "name": name,
+                        "id": ident,
+                        "ok": True,
+                        "path": result.get("path"),
+                        "due_before": row["renewal_due_before"],
+                        "due_after": row["renewal_due_after"],
+                        "cost": row["renewal_cost"],
+                    }
+                )
+            else:
+                err = result.get("error") or "renew failed"
+                row["errors"].append(f"renew: {err}")
+                report["actions"].append(f"renew {name} failed: {err}")
+                report["renewals"].append(
+                    {
+                        "name": name,
+                        "id": ident,
+                        "ok": False,
+                        "error": err,
+                        "code": result.get("code"),
+                        "due_before": row["renewal_due_before"],
+                        "cost": row["renewal_cost"],
+                    }
+                )
+                log(f"✗ 续期失败 {name}: {err}", "err")
+
+        # 2) 关机再重启（用户要求：关机 + 点击重启）
+        if do_restart and ident:
+            ok = restart_server(client, ident)
+            row["restarted"] = ok
+            if ok:
+                report["actions"].append(f"restart {name} ok")
+                report["restarts"].append({"name": name, "id": ident, "ok": True})
+                log(f"✓ 重启完成 {name}", "ok")
+                # 等几秒再读状态
+                time.sleep(2)
+            else:
+                row["errors"].append("restart failed")
+                report["actions"].append(f"restart {name} failed")
+                report["restarts"].append({"name": name, "id": ident, "ok": False})
+                log(f"✗ 重启失败 {name}", "err")
+        elif do_start and ident and state in {
+            "offline",
+            "stopped",
+            "stopping",
+            "exited",
+            "installing",
+            "suspended",
+            "",
+        }:
+            ok = start_server(client, ident)
+            row["started"] = ok
+            if ok:
                 report["actions"].append(f"start {name}")
+                log(f"✓ 开机 {name}", "ok")
+            else:
+                row["errors"].append("start failed")
+                report["actions"].append(f"start {name} failed")
+
+        report["servers"].append(row)
+
+    # 刷新 credits + 服务器状态（续期/重启后的准确反馈）
+    try:
+        credits_after = get_credits(client)
+        report["credits_after"] = credits_after
+        report["credits"] = credits_after
+        log(f"credits after = {credits_after} (was {credits_before})", "info")
+    except Exception as exc:  # noqa: BLE001
+        log(f"credits refresh: {exc}", "warn")
+
+    try:
+        refreshed = {server_ident(s): s for s in list_servers(client)}
+        for row in report["servers"]:
+            s2 = refreshed.get(row["id"])
+            if not s2:
+                continue
+            row["state_after"] = server_state(s2)
+            ren2 = server_renewal_info(s2)
+            if ren2.get("due") is not None:
+                row["renewal_due_after"] = ren2.get("due")
+            # sync into renewals list
+            for r in report["renewals"]:
+                if r.get("id") == row["id"] and row.get("renewal_due_after") is not None:
+                    r["due_after"] = row["renewal_due_after"]
+    except Exception as exc:  # noqa: BLE001
+        log(f"server refresh: {exc}", "warn")
+
     return report
 
 
@@ -743,17 +944,26 @@ def format_report(results: list[dict[str, Any]]) -> str:
         lines.append(f"账号 {item.get('account')}  mode={item.get('mode')}")
         renew = item.get("renew") or {}
         if renew:
-            lines.append(f"  Credits: {renew.get('credits')}")
-            for sub in renew.get("subscriptions") or []:
-                lines.append(
-                    f"  套餐 {sub.get('name')}  {sub.get('status')}  next={sub.get('next_renewal_at')}"
-                )
-            if not renew.get("subscriptions") and renew.get("plans"):
-                lines.append("  (无订阅) 可用套餐:")
-                for p in renew["plans"][:5]:
-                    lines.append(f"    id={p.get('id')} {p.get('name')} price={p.get('price')}")
+            cb = renew.get("credits_before", renew.get("credits"))
+            ca = renew.get("credits_after", renew.get("credits"))
+            lines.append(f"  Credits: {cb} → {ca}")
+            for r in renew.get("renewals") or []:
+                if r.get("ok"):
+                    lines.append(
+                        f"  ✅ 续期 {r.get('name')}: due {r.get('due_before')} → {r.get('due_after')} "
+                        f"(cost={r.get('cost')})"
+                    )
+                else:
+                    lines.append(f"  ❌ 续期 {r.get('name')}: {r.get('error')}")
+            for r in renew.get("restarts") or []:
+                mark = "✅" if r.get("ok") else "❌"
+                lines.append(f"  {mark} 重启 {r.get('name')}")
             for srv in renew.get("servers") or []:
-                lines.append(f"  服务器 {srv.get('name')}  {srv.get('state')}")
+                lines.append(
+                    f"  服务器 {srv.get('name')}  "
+                    f"{srv.get('state_before')}→{srv.get('state_after')}  "
+                    f"due {srv.get('renewal_due_before')}→{srv.get('renewal_due_after')}"
+                )
             for act in renew.get("actions") or []:
                 lines.append(f"  动作: {act}")
         for key in ("afk", "mobile"):
@@ -771,7 +981,7 @@ def format_report(results: list[dict[str, Any]]) -> str:
 
 
 def format_report_html(results: list[dict[str, Any]]) -> str:
-    """Telegram HTML status card (acts as a readable screenshot)."""
+    """Telegram HTML status card — accurate renew/restart screenshot feedback."""
     ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
     parts = [
         "<b>🏰 CastleKeep · SkyCastle</b>",
@@ -788,31 +998,63 @@ def format_report_html(results: list[dict[str, Any]]) -> str:
             continue
         renew = item.get("renew") or {}
         if renew:
-            credits = renew.get("credits")
-            parts.append(f"💰 Credits: <b>{credits}</b>")
-            subs = renew.get("subscriptions") or []
-            if subs:
-                for sub in subs:
-                    name = _html_escape(str(sub.get("name") or "?"))
-                    st = _html_escape(str(sub.get("status") or "?"))
-                    nxt = _html_escape(str(sub.get("next_renewal_at") or "-"))
-                    parts.append(f"📦 套餐 <b>{name}</b> · {st}")
-                    parts.append(f"   下次续期: <code>{nxt}</code>")
-            else:
-                parts.append("📦 套餐: <i>无订阅</i>")
-                for p in (renew.get("plans") or [])[:3]:
-                    parts.append(
-                        f"   可选 id=<code>{p.get('id')}</code> "
-                        f"{_html_escape(str(p.get('name') or ''))} "
-                        f"price={p.get('price')}"
-                    )
+            cb = renew.get("credits_before", renew.get("credits"))
+            ca = renew.get("credits_after", renew.get("credits"))
+            parts.append(f"💰 Credits: <b>{cb}</b> → <b>{ca}</b>")
+
+            renewals = renew.get("renewals") or []
+            if renewals:
+                parts.append("<b>📅 续期结果</b>")
+                for r in renewals:
+                    name = _html_escape(str(r.get("name") or "?"))
+                    if r.get("ok"):
+                        parts.append(
+                            f"✅ <b>{name}</b> 续期成功\n"
+                            f"   Due: <code>{_html_escape(str(r.get('due_before') or '-'))}</code>"
+                            f" → <code>{_html_escape(str(r.get('due_after') or '-'))}</code>\n"
+                            f"   花费: <code>{_html_escape(str(r.get('cost') or '?'))}</code> credits"
+                        )
+                    else:
+                        parts.append(
+                            f"❌ <b>{name}</b> 续期失败\n"
+                            f"   {_html_escape(str(r.get('error') or 'unknown'))}"
+                        )
+
+            restarts = renew.get("restarts") or []
+            if restarts:
+                parts.append("<b>🔄 重启结果</b>")
+                for r in restarts:
+                    name = _html_escape(str(r.get("name") or "?"))
+                    if r.get("ok"):
+                        # find state after from servers list
+                        st_after = "?"
+                        for srv in renew.get("servers") or []:
+                            if srv.get("id") == r.get("id") or srv.get("name") == r.get("name"):
+                                st_after = srv.get("state_after") or srv.get("state_before") or "?"
+                                break
+                        parts.append(
+                            f"✅ <b>{name}</b> 重启完成 · 状态 <code>{_html_escape(str(st_after))}</code>"
+                        )
+                    else:
+                        parts.append(f"❌ <b>{name}</b> 重启失败")
+
             for srv in renew.get("servers") or []:
                 name = _html_escape(str(srv.get("name") or "?"))
-                st = _html_escape(str(srv.get("state") or "unknown"))
-                icon = "🟢" if st in {"running", "online", "started"} else "🔴"
-                parts.append(f"{icon} 服务器 <b>{name}</b> · <code>{st}</code>")
-            for act in renew.get("actions") or []:
-                parts.append(f"⚡ {_html_escape(act)}")
+                sb = _html_escape(str(srv.get("state_before") or "?"))
+                sa = _html_escape(str(srv.get("state_after") or "?"))
+                icon = "🟢" if str(srv.get("state_after") or "").lower() in {
+                    "running",
+                    "online",
+                    "started",
+                    "starting",
+                } else "🟡"
+                parts.append(f"{icon} 服务器 <b>{name}</b> · <code>{sb}→{sa}</code>")
+                if srv.get("renewal_due_before") or srv.get("renewal_due_after"):
+                    parts.append(
+                        f"   Due <code>{_html_escape(str(srv.get('renewal_due_before') or '-'))}</code>"
+                        f" → <code>{_html_escape(str(srv.get('renewal_due_after') or '-'))}</code>"
+                    )
+
         for key in ("afk", "mobile"):
             block = item.get(key)
             if block:
@@ -825,7 +1067,7 @@ def format_report_html(results: list[dict[str, Any]]) -> str:
                     f"(<code>{before}→{after}</code>) · {mins} min"
                 )
         parts.append("")
-    parts.append("<i>自动续期 + AFK 完成</i>")
+    parts.append("<i>服务器续期 + 重启 + AFK 完成</i>")
     return "\n".join(parts)
 
 
@@ -964,8 +1206,13 @@ def notify(text: str, results: list[dict[str, Any]] | None = None, cache_dir: st
                 for item in results:
                     renew = item.get("renew") or {}
                     afk = item.get("afk") or {}
+                    ren_ok = sum(1 for r in (renew.get("renewals") or []) if r.get("ok"))
+                    ren_fail = sum(1 for r in (renew.get("renewals") or []) if not r.get("ok"))
+                    rst_ok = sum(1 for r in (renew.get("restarts") or []) if r.get("ok"))
                     caption = (
-                        f"Credits {renew.get('credits', '?')} · "
+                        f"Credits {renew.get('credits_before', '?')}→{renew.get('credits_after', renew.get('credits', '?'))} · "
+                        f"续期 {ren_ok}ok/{ren_fail}fail · "
+                        f"重启 {rst_ok} · "
                         f"AFK +{afk.get('delta', 0)} · "
                         f"{time.strftime('%H:%M UTC', time.gmtime())}"
                     )
