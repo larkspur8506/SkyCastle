@@ -224,6 +224,45 @@ class PanelClient:
                 return c.value
         return ""
 
+    def export_cookies_for_browser(self) -> list[dict[str, Any]]:
+        """Export urllib cookie jar for Playwright context.add_cookies()."""
+        host = urllib.parse.urlparse(self.base).hostname or "panel.skycastle.us"
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for c in self.jar:
+            if not c.value:
+                continue
+            domain = (c.domain or host).lstrip(".")
+            key = f"{c.name}@{domain}"
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                {
+                    "name": c.name,
+                    "value": c.value,
+                    "domain": domain,
+                    "path": c.path or "/",
+                    "secure": bool(getattr(c, "secure", True)) or True,
+                    "httpOnly": True,
+                    "sameSite": "Lax",
+                }
+            )
+        token = self.get_remember_token()
+        if token and not any(x["name"] == "remember_token" for x in out):
+            out.append(
+                {
+                    "name": "remember_token",
+                    "value": token,
+                    "domain": host,
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                    "sameSite": "Lax",
+                }
+            )
+        return out
+
     def request(
         self,
         method: str,
@@ -922,19 +961,47 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
             "info",
         )
 
-        # 1) 服务器卡片「续期」按钮
+        # 1) 服务器卡片「续期」：先试 API，失败则用浏览器点击 RENEWAL
         if do_renew and ident:
             result = renew_server(client, ident, extra_ids=extra_ids)
+            if not result.get("ok"):
+                log(f"API renew miss → try browser click RENEWAL for {name}", "warn")
+                cookies = client.export_cookies_for_browser()
+                browser_result = browser_click_renew(
+                    panel=client.base,
+                    cookies=cookies,
+                    cache_dir=client.cache_dir,
+                    server_name=name,
+                )
+                if browser_result.get("ok"):
+                    result = browser_result
+                else:
+                    # keep API error but attach browser error
+                    result = {
+                        "ok": False,
+                        "error": (
+                            f"API: {result.get('error')}; "
+                            f"browser: {browser_result.get('error')}"
+                        )[:220],
+                        "code": browser_result.get("code") or result.get("code"),
+                        "probed": result.get("probed"),
+                        "before": browser_result.get("before"),
+                        "after": browser_result.get("after"),
+                    }
+
             if result.get("ok"):
                 row["renewed"] = True
                 report["actions"].append(f"renew {name} ok via {result.get('path')}")
-                log(f"✓ 续期完成 {name}", "ok")
+                log(f"✓ 续期完成 {name} via {result.get('path')}", "ok")
                 data = result.get("data") or {}
                 if isinstance(data, dict):
                     for k in ("due_at", "expires_at", "next_renewal_at", "renewal_due_at", "due"):
                         if data.get(k) is not None:
                             row["renewal_due_after"] = data.get(k)
                             break
+                # prefer expires_at from server object as due
+                if not row.get("renewal_due_before") and srv.get("expires_at"):
+                    row["renewal_due_before"] = srv.get("expires_at")
                 report["renewals"].append(
                     {
                         "name": name,
@@ -944,6 +1011,8 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
                         "due_before": row["renewal_due_before"],
                         "due_after": row["renewal_due_after"],
                         "cost": row["renewal_cost"],
+                        "before": result.get("before"),
+                        "after": result.get("after"),
                     }
                 )
             else:
@@ -957,9 +1026,11 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
                         "ok": False,
                         "error": err,
                         "code": result.get("code"),
-                        "due_before": row["renewal_due_before"],
+                        "due_before": row["renewal_due_before"] or srv.get("expires_at"),
                         "cost": row["renewal_cost"],
                         "probed": result.get("probed"),
+                        "before": result.get("before"),
+                        "after": result.get("after"),
                     }
                 )
                 log(f"✗ 续期失败 {name}: {err}", "err")
@@ -1213,76 +1284,122 @@ def _tg_api(token: str, method: str, fields: dict[str, Any], files: dict[str, tu
     urllib.request.urlopen(req, timeout=45).read()
 
 
+def _playwright_open_servers(
+    panel: str,
+    cookies: list[dict[str, Any]],
+    path: str = "/dashboard/servers",
+):
+    """Open authenticated servers page. Returns (playwright, browser, context, page) or raises."""
+    from playwright.sync_api import sync_playwright  # type: ignore
+
+    panel = panel.rstrip("/")
+    target = f"{panel}{path}"
+    host = urllib.parse.urlparse(panel).hostname or "panel.skycastle.us"
+
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    )
+    context = browser.new_context(
+        viewport={"width": 1400, "height": 1000},
+        user_agent=UA_DESKTOP,
+        locale="zh-CN",
+        color_scheme="dark",
+    )
+    # Playwright requires a navigation before add_cookies on some versions —
+    # seed the domain first, then set cookies, then go to target.
+    try:
+        page = context.new_page()
+        page.goto(panel + "/", wait_until="domcontentloaded", timeout=60000)
+        if cookies:
+            # also mirror under leading-dot domain
+            expanded = list(cookies)
+            for c in cookies:
+                d = dict(c)
+                dom = str(d.get("domain") or host).lstrip(".")
+                d["domain"] = f".{dom}"
+                expanded.append(d)
+            context.add_cookies(expanded)
+        page.goto(target, wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_timeout(3500)
+        if "login" in (page.url or "").lower() or "/auth/" in (page.url or "").lower():
+            # one more cookie re-inject + navigate
+            if cookies:
+                context.add_cookies(cookies)
+            page.goto(target, wait_until="domcontentloaded", timeout=90000)
+            page.wait_for_timeout(3500)
+        return pw, browser, context, page, target
+    except Exception:
+        try:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        raise
+
+
 def capture_panel_screenshot(
     panel: str,
-    remember_token: str,
-    cache_dir: str,
+    remember_token: str = "",
+    cache_dir: str = ".skycastle-cache",
     path: str = "/dashboard/servers",
     filename: str = "panel-servers.png",
+    cookies: list[dict[str, Any]] | None = None,
 ) -> tuple[str | None, str]:
     """Real browser screenshot of the panel page (requires playwright + chromium).
 
     Returns (absolute path to PNG or None, status message).
     """
-    if not remember_token:
-        msg = "screenshot skipped: no remember_token (set SKYCASTLE_TOKEN)"
+    host = urllib.parse.urlparse(panel.rstrip("/")).hostname or "panel.skycastle.us"
+    jar_cookies = list(cookies or [])
+    if remember_token and not any(c.get("name") == "remember_token" for c in jar_cookies):
+        jar_cookies.append(
+            {
+                "name": "remember_token",
+                "value": remember_token,
+                "domain": host,
+                "path": "/",
+                "secure": True,
+                "httpOnly": True,
+                "sameSite": "Lax",
+            }
+        )
+    if not jar_cookies:
+        msg = "screenshot skipped: no cookies / remember_token"
         log(msg, "warn")
         return None, msg
     try:
-        from playwright.sync_api import sync_playwright  # type: ignore
+        from playwright.sync_api import sync_playwright  # noqa: F401
     except ImportError:
         msg = (
             "screenshot skipped: playwright not installed "
-            "(workflow should: pip install playwright && playwright install --with-deps chromium)"
+            "(pip install playwright && playwright install --with-deps chromium)"
         )
         log(msg, "warn")
         return None, msg
 
     os.makedirs(cache_dir, exist_ok=True)
     out = os.path.abspath(os.path.join(cache_dir, filename))
-    panel = panel.rstrip("/")
-    target = f"{panel}{path}"
-    host = urllib.parse.urlparse(panel).hostname or "panel.skycastle.us"
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-            )
-            context = browser.new_context(
-                viewport={"width": 1400, "height": 1000},
-                user_agent=UA_DESKTOP,
-                locale="zh-CN",
-                color_scheme="dark",
-            )
-            # Cookie for both host and .host
-            cookies = []
-            for domain in {host, f".{host}"}:
-                cookies.append(
-                    {
-                        "name": "remember_token",
-                        "value": remember_token,
-                        "domain": domain,
-                        "path": "/",
-                        "secure": True,
-                        "httpOnly": True,
-                        "sameSite": "Lax",
-                    }
-                )
-            context.add_cookies(cookies)
-            page = context.new_page()
-            # domcontentloaded is more reliable than networkidle on SPAs
-            page.goto(target, wait_until="domcontentloaded", timeout=90000)
-            page.wait_for_timeout(4000)
-            # If redirected to login, try once more after cookie settle
-            if "login" in (page.url or "").lower() or "auth" in (page.url or "").lower():
-                log(f"screenshot landed on auth page ({page.url}), retry…", "warn")
-                page.goto(target, wait_until="domcontentloaded", timeout=90000)
-                page.wait_for_timeout(4000)
+        pw, browser, context, page, _target = _playwright_open_servers(panel, jar_cookies, path)
+        try:
             page.screenshot(path=out, full_page=True, type="png")
             final_url = page.url
+        finally:
             browser.close()
+            pw.stop()
+        if "login" in (final_url or "").lower() or "/auth/" in (final_url or "").lower():
+            msg = f"screenshot still on login page ({final_url}) — cookie auth failed for browser"
+            log(msg, "warn")
+            # still send the image so user can see what happened
+            if os.path.isfile(out) and os.path.getsize(out) > 2000:
+                return out, msg
+            return None, msg
         if os.path.isfile(out) and os.path.getsize(out) > 2000:
             msg = f"panel screenshot ok → {out} ({os.path.getsize(out)} bytes) url={final_url}"
             log(msg, "ok")
@@ -1294,6 +1411,119 @@ def capture_panel_screenshot(
         msg = f"playwright screenshot failed: {exc}"
         log(msg, "warn")
         return None, msg
+
+
+def browser_click_renew(
+    panel: str,
+    cookies: list[dict[str, Any]],
+    cache_dir: str = ".skycastle-cache",
+    server_name: str = "",
+) -> dict[str, Any]:
+    """Use Playwright to click the RENEWAL button on /dashboard/servers.
+
+    Falls back when API renew routes do not exist (SkyCastle custom UI).
+    """
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+    except ImportError:
+        return {"ok": False, "error": "playwright not installed", "code": "NO_PLAYWRIGHT"}
+
+    os.makedirs(cache_dir, exist_ok=True)
+    before = os.path.abspath(os.path.join(cache_dir, "renew-before.png"))
+    after = os.path.abspath(os.path.join(cache_dir, "renew-after.png"))
+
+    try:
+        pw, browser, context, page, _ = _playwright_open_servers(
+            panel, cookies, "/dashboard/servers"
+        )
+        try:
+            if "login" in (page.url or "").lower() or "/auth/" in (page.url or "").lower():
+                return {
+                    "ok": False,
+                    "error": f"browser on login page ({page.url})",
+                    "code": "AUTH_FAILED",
+                }
+            page.screenshot(path=before, full_page=True, type="png")
+
+            # Prefer button/link containing RENEWAL text near the server card
+            clicked = False
+            selectors = [
+                "button:has-text('RENEWAL')",
+                "button:has-text('Renewal')",
+                "button:has-text('续期')",
+                "a:has-text('RENEWAL')",
+                "[class*='renew' i]",
+                "text=RENEWAL",
+            ]
+            for sel in selectors:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() == 0:
+                        continue
+                    # if server_name known, prefer card that contains it
+                    target_loc = loc.first
+                    if server_name:
+                        card = page.locator(f"text={server_name}").first
+                        if card.count():
+                            near = card.locator("xpath=ancestor::*[.//button or .//a][1]")
+                            # fall back to first RENEWAL on page
+                            pass
+                    target_loc.click(timeout=5000)
+                    clicked = True
+                    log(f"clicked RENEWAL via selector {sel}", "ok")
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    log(f"renew click try {sel}: {exc}", "info")
+                    continue
+
+            if not clicked:
+                # last resort: any element with text RENEWAL
+                try:
+                    page.get_by_text("RENEWAL", exact=False).first.click(timeout=5000)
+                    clicked = True
+                    log("clicked RENEWAL via get_by_text", "ok")
+                except Exception as exc:  # noqa: BLE001
+                    page.screenshot(path=after, full_page=True, type="png")
+                    return {
+                        "ok": False,
+                        "error": f"RENEWAL button not found: {exc}",
+                        "code": "NO_BUTTON",
+                        "before": before if os.path.isfile(before) else None,
+                        "after": after if os.path.isfile(after) else None,
+                    }
+
+            page.wait_for_timeout(3000)
+            # confirm dialogs (OK / Confirm / 确认)
+            for confirm_sel in (
+                "button:has-text('Confirm')",
+                "button:has-text('OK')",
+                "button:has-text('确认')",
+                "button:has-text('续期')",
+                "[role='dialog'] button:has-text('Confirm')",
+            ):
+                try:
+                    btn = page.locator(confirm_sel)
+                    if btn.count() > 0 and btn.first.is_visible():
+                        btn.first.click(timeout=3000)
+                        log(f"clicked confirm {confirm_sel}", "ok")
+                        page.wait_for_timeout(2000)
+                        break
+                except Exception:
+                    continue
+
+            page.wait_for_timeout(2000)
+            page.screenshot(path=after, full_page=True, type="png")
+            return {
+                "ok": True,
+                "path": "browser:RENEWAL",
+                "before": before if os.path.isfile(before) else None,
+                "after": after if os.path.isfile(after) else None,
+            }
+        finally:
+            browser.close()
+            pw.stop()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200], "code": "BROWSER_ERROR"}
 
 
 def notify(
@@ -1354,12 +1584,18 @@ def notify(
                     break
 
                 rtoken = remember_token or env("SKYCASTLE_TOKEN") or env("SKYCASTLE_REMEMBER_TOKEN")
+                jar_cookies: list[dict[str, Any]] = []
+                for item in results:
+                    if item.get("cookies"):
+                        jar_cookies = list(item["cookies"])
+                        break
                 shot, shot_msg = capture_panel_screenshot(
                     panel=panel,
                     remember_token=rtoken,
                     cache_dir=cache_dir,
                     path=env("SKYCASTLE_SCREENSHOT_PATH") or "/dashboard/servers",
                     filename="panel-servers.png",
+                    cookies=jar_cookies,
                 )
                 if shot:
                     with open(shot, "rb") as fh:
@@ -1372,7 +1608,6 @@ def notify(
                     )
                     log("telegram real panel screenshot sent", "ok")
                 else:
-                    # 明确告诉 TG 为什么没图
                     try:
                         _tg_api(
                             token,
@@ -1387,6 +1622,29 @@ def notify(
                     except Exception:
                         pass
                     log(f"real screenshot unavailable: {shot_msg}", "warn")
+
+                # 续期前后截图（浏览器点击 RENEWAL 时生成）
+                for item in results:
+                    renew = item.get("renew") or {}
+                    for r in renew.get("renewals") or []:
+                        for label, key in (("续期前", "before"), ("续期后", "after")):
+                            p = r.get(key)
+                            if p and os.path.isfile(p):
+                                try:
+                                    with open(p, "rb") as fh:
+                                        data = fh.read()
+                                    _tg_api(
+                                        token,
+                                        "sendPhoto",
+                                        {
+                                            "chat_id": chat,
+                                            "caption": f"{label} · {r.get('name') or ''} · "
+                                            f"{'OK' if r.get('ok') else 'FAIL'}",
+                                        },
+                                        files={"photo": (os.path.basename(p), data)},
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    log(f"tg send {label} shot: {exc}", "warn")
             except Exception as exc:  # noqa: BLE001
                 log(f"telegram screenshot failed: {exc}", "warn")
 
@@ -1397,6 +1655,7 @@ def notify(
                 for item in results:
                     copy = dict(item)
                     copy.pop("remember_token", None)
+                    copy.pop("cookies", None)
                     safe.append(copy)
                 raw = json.dumps(safe, ensure_ascii=False, indent=2).encode("utf-8")
                 _tg_api(
@@ -1434,6 +1693,7 @@ def run_account(account: dict[str, str], mode: str, minutes: int, panel: str, ca
         "mode": mode,
         "panel": panel,
         "remember_token": client.get_remember_token() or account.get("token") or "",
+        "cookies": client.export_cookies_for_browser(),
     }
 
     if mode in {"all", "renew", "status"}:
@@ -1530,6 +1790,7 @@ def main(argv: list[str] | None = None) -> int:
     for item in results:
         copy = dict(item)
         copy.pop("remember_token", None)
+        copy.pop("cookies", None)
         safe_results.append(copy)
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(safe_results, fh, ensure_ascii=False, indent=2)
