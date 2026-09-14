@@ -24,6 +24,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install Playwright (real panel screenshots)
+        run: |
+          pip install --quiet playwright
+          playwright install --with-deps chromium
       - uses: actions/cache@v4
         with:
           path: .skycastle-cache
@@ -44,6 +48,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          SKYCASTLE_TG_SCREENSHOT: ${{ secrets.SKYCASTLE_TG_SCREENSHOT || '1' }}
+          SKYCASTLE_SCREENSHOT_PATH: ${{ secrets.SKYCASTLE_SCREENSHOT_PATH || '/dashboard/servers' }}
           SKYCASTLE_MODE: afk
           SKYCASTLE_AFK_MINUTES: ${{ github.event.inputs.minutes || '10' }}
           PYTHONUNBUFFERED: "1"

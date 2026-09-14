@@ -40,6 +40,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install Playwright (real panel screenshots)
+        run: |
+          pip install --quiet playwright
+          playwright install --with-deps chromium
+
       - name: Restore remember_token cache
         uses: actions/cache@v4
         with:
@@ -61,6 +66,10 @@ jobs:
           SKYCASTLE_PLAN_ID: ${{ secrets.SKYCASTLE_PLAN_ID }}
           SKYCASTLE_COUPON: ${{ secrets.SKYCASTLE_COUPON }}
           SKYCASTLE_START_SERVERS: ${{ secrets.SKYCASTLE_START_SERVERS || '1' }}
+          SKYCASTLE_SERVER_RENEW: ${{ secrets.SKYCASTLE_SERVER_RENEW || '1' }}
+          SKYCASTLE_RESTART_SERVERS: ${{ secrets.SKYCASTLE_RESTART_SERVERS || '1' }}
+          SKYCASTLE_TG_SCREENSHOT: ${{ secrets.SKYCASTLE_TG_SCREENSHOT || '1' }}
+          SKYCASTLE_SCREENSHOT_PATH: ${{ secrets.SKYCASTLE_SCREENSHOT_PATH || '/dashboard/servers' }}
           SKYCASTLE_TURNSTILE_SITEKEY: ${{ secrets.SKYCASTLE_TURNSTILE_SITEKEY }}
           CAPSOLVER_KEY: ${{ secrets.CAPSOLVER_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
