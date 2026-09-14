@@ -1107,65 +1107,87 @@ def _tg_api(token: str, method: str, fields: dict[str, Any], files: dict[str, tu
     urllib.request.urlopen(req, timeout=45).read()
 
 
-def build_status_png(results: list[dict[str, Any]], width: int = 720, height: int = 360) -> bytes:
-    """Minimal pure-stdlib status card PNG (solid bg + simple bars, no font needed).
-    Acts as a visual 'screenshot' for Telegram. Text details go in the caption.
+def capture_panel_screenshot(
+    panel: str,
+    remember_token: str,
+    cache_dir: str,
+    path: str = "/dashboard/servers",
+    filename: str = "panel-servers.png",
+) -> str | None:
+    """Real browser screenshot of the panel page (requires playwright + chromium).
+
+    Returns absolute path to PNG, or None if unavailable.
     """
-    import zlib
+    if not remember_token:
+        log("screenshot skipped: no remember_token", "warn")
+        return None
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except ImportError:
+        log(
+            "screenshot skipped: playwright not installed "
+            "(pip install playwright && playwright install chromium)",
+            "warn",
+        )
+        return None
 
-    # Dark card background + accent bar
-    bg = (22, 27, 34)  # near GitHub dark
-    accent = (63, 185, 80)  # green success
-    warn = (210, 153, 34)
-    err = (248, 81, 73)
-    muted = (48, 54, 61)
+    os.makedirs(cache_dir, exist_ok=True)
+    out = os.path.abspath(os.path.join(cache_dir, filename))
+    panel = panel.rstrip("/")
+    target = f"{panel}{path}"
+    host = urllib.parse.urlparse(panel).hostname or "panel.skycastle.us"
 
-    pixels = bytearray()
-    has_error = any(item.get("error") for item in results)
-    top_color = err if has_error else accent
-
-    for y in range(height):
-        for x in range(width):
-            if y < 8:
-                r, g, b = top_color
-            elif y < 10:
-                r, g, b = muted
-            else:
-                r, g, b = bg
-            # left accent strip
-            if x < 6:
-                r, g, b = top_color
-            # bottom progress-style bar representing AFK delta
-            if y > height - 14:
-                r, g, b = muted
-                total_delta = 0
-                for item in results:
-                    for key in ("afk", "mobile"):
-                        block = item.get(key) or {}
-                        total_delta += int(block.get("delta") or 0)
-                # scale bar: each credit ~ 40px, capped
-                bar_w = min(width - 20, max(0, total_delta) * 40 + 20)
-                if 10 <= x < 10 + bar_w:
-                    r, g, b = accent if not has_error else warn
-            pixels.extend((r, g, b))
-
-    # PNG encode (RGB, no filter sophistication)
-    def chunk(tag: bytes, data: bytes) -> bytes:
-        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-
-    raw = b"".join(b"\x00" + pixels[i : i + width * 3] for i in range(0, len(pixels), width * 3))
-    compressed = zlib.compress(raw, 9)
-    png = b"\x89PNG\r\n\x1a\n"
-    png += chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-    png += chunk(b"IDAT", compressed)
-    png += chunk(b"IEND", b"")
-    return png
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent=UA_DESKTOP,
+                locale="zh-CN",
+            )
+            context.add_cookies(
+                [
+                    {
+                        "name": "remember_token",
+                        "value": remember_token,
+                        "domain": host,
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": True,
+                    }
+                ]
+            )
+            page = context.new_page()
+            page.goto(target, wait_until="networkidle", timeout=60000)
+            # SPA may still paint cards after networkidle
+            page.wait_for_timeout(2500)
+            # Prefer full page so RENEWAL / server cards are visible
+            page.screenshot(path=out, full_page=True, type="png")
+            browser.close()
+        if os.path.isfile(out) and os.path.getsize(out) > 1000:
+            log(f"panel screenshot saved → {out} ({os.path.getsize(out)} bytes)", "ok")
+            return out
+        log(f"screenshot file missing or too small: {out}", "warn")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        log(f"playwright screenshot failed: {exc}", "warn")
+        return None
 
 
-def notify(text: str, results: list[dict[str, Any]] | None = None, cache_dir: str = ".skycastle-cache") -> None:
+def notify(
+    text: str,
+    results: list[dict[str, Any]] | None = None,
+    cache_dir: str = ".skycastle-cache",
+    panel: str = "",
+    remember_token: str = "",
+) -> None:
     token = env("TELEGRAM_BOT_TOKEN") or env("TELEGRAM_TOKEN")
     chat = env("TELEGRAM_CHAT_ID") or env("TELEGRAM_CHAT")
     results = results or []
+    panel = panel or env("SKYCASTLE_PANEL") or PANEL_DEFAULT
 
     if token and chat:
         html = format_report_html(results) if results else _html_escape(text)
@@ -1184,7 +1206,6 @@ def notify(text: str, results: list[dict[str, Any]] | None = None, cache_dir: st
             log("telegram HTML status sent", "ok")
         except Exception as exc:  # noqa: BLE001
             log(f"telegram HTML notify failed: {exc}", "warn")
-            # fallback plain
             try:
                 _tg_api(
                     token,
@@ -1194,43 +1215,56 @@ def notify(text: str, results: list[dict[str, Any]] | None = None, cache_dir: st
             except Exception as exc2:  # noqa: BLE001
                 log(f"telegram plain notify failed: {exc2}", "warn")
 
-        # 2) 状态截图 (PNG 卡片) + caption
-        if env("SKYCASTLE_TG_SCREENSHOT", "1") not in {"0", "false", "no"} and results:
+        # 2) 真实面板截图（dashboard/servers）
+        if env("SKYCASTLE_TG_SCREENSHOT", "1") not in {"0", "false", "no"}:
             try:
-                png = build_status_png(results)
-                os.makedirs(cache_dir, exist_ok=True)
-                png_path = os.path.join(cache_dir, "status-card.png")
-                with open(png_path, "wb") as fh:
-                    fh.write(png)
-                caption = "CastleKeep status card"
+                caption = "CastleKeep · panel /dashboard/servers"
                 for item in results:
                     renew = item.get("renew") or {}
                     afk = item.get("afk") or {}
                     ren_ok = sum(1 for r in (renew.get("renewals") or []) if r.get("ok"))
                     ren_fail = sum(1 for r in (renew.get("renewals") or []) if not r.get("ok"))
                     rst_ok = sum(1 for r in (renew.get("restarts") or []) if r.get("ok"))
+                    cb = renew.get("credits_before", renew.get("credits", "?"))
+                    ca = renew.get("credits_after", renew.get("credits", "?"))
                     caption = (
-                        f"Credits {renew.get('credits_before', '?')}→{renew.get('credits_after', renew.get('credits', '?'))} · "
-                        f"续期 {ren_ok}ok/{ren_fail}fail · "
-                        f"重启 {rst_ok} · "
-                        f"AFK +{afk.get('delta', 0)} · "
+                        f"Credits {cb}→{ca} · 续期 {ren_ok}ok/{ren_fail}fail · "
+                        f"重启 {rst_ok} · AFK +{afk.get('delta', 0)} · "
                         f"{time.strftime('%H:%M UTC', time.gmtime())}"
                     )
                     break
-                _tg_api(
-                    token,
-                    "sendPhoto",
-                    {"chat_id": chat, "caption": caption[:900]},
-                    files={"photo": ("status-card.png", png)},
+
+                shot = capture_panel_screenshot(
+                    panel=panel,
+                    remember_token=remember_token or env("SKYCASTLE_TOKEN") or env("SKYCASTLE_REMEMBER_TOKEN"),
+                    cache_dir=cache_dir,
+                    path=env("SKYCASTLE_SCREENSHOT_PATH") or "/dashboard/servers",
+                    filename="panel-servers.png",
                 )
-                log("telegram status screenshot sent", "ok")
+                if shot:
+                    with open(shot, "rb") as fh:
+                        png = fh.read()
+                    _tg_api(
+                        token,
+                        "sendPhoto",
+                        {"chat_id": chat, "caption": caption[:900]},
+                        files={"photo": ("panel-servers.png", png)},
+                    )
+                    log("telegram real panel screenshot sent", "ok")
+                else:
+                    log("real screenshot unavailable — HTML report only", "warn")
             except Exception as exc:  # noqa: BLE001
                 log(f"telegram screenshot failed: {exc}", "warn")
 
         # 3) 可选：附带 JSON 报告文件
         if env("SKYCASTLE_TG_DOCUMENT", "0") in {"1", "true", "yes"} and results:
             try:
-                raw = json.dumps(results, ensure_ascii=False, indent=2).encode("utf-8")
+                safe = []
+                for item in results:
+                    copy = dict(item)
+                    copy.pop("remember_token", None)
+                    safe.append(copy)
+                raw = json.dumps(safe, ensure_ascii=False, indent=2).encode("utf-8")
                 _tg_api(
                     token,
                     "sendDocument",
@@ -1261,7 +1295,12 @@ def run_account(account: dict[str, str], mode: str, minutes: int, panel: str, ca
     log(f"===== {who} · mode={mode} · panel={panel} =====")
     client = PanelClient(panel, profile="desktop" if mode != "mobile" else "mobile", cache_dir=cache_dir)
     login(client, account)
-    summary: dict[str, Any] = {"account": who, "mode": mode}
+    summary: dict[str, Any] = {
+        "account": who,
+        "mode": mode,
+        "panel": panel,
+        "remember_token": client.get_remember_token() or account.get("token") or "",
+    }
 
     if mode in {"all", "renew", "status"}:
         summary["renew"] = run_renew(client, account)
@@ -1284,6 +1323,8 @@ def run_account(account: dict[str, str], mode: str, minutes: int, panel: str, ca
         }
         log(json.dumps(summary["afk_status"], ensure_ascii=False), "info")
 
+    # keep latest token after operations
+    summary["remember_token"] = client.get_remember_token() or summary.get("remember_token") or ""
     return summary
 
 
@@ -1335,11 +1376,29 @@ def main(argv: list[str] | None = None) -> int:
 
     report = format_report(results)
     print("\n" + report, flush=True)
-    notify(report, results=results, cache_dir=args.cache)
+    remember = ""
+    for item in results:
+        if item.get("remember_token"):
+            remember = str(item["remember_token"])
+            break
+    if not remember:
+        remember = env("SKYCASTLE_TOKEN") or env("SKYCASTLE_REMEMBER_TOKEN")
+    notify(
+        report,
+        results=results,
+        cache_dir=args.cache,
+        panel=args.panel,
+        remember_token=remember,
+    )
     out = os.path.join(args.cache, "last-report.json")
     os.makedirs(args.cache, exist_ok=True)
+    safe_results = []
+    for item in results:
+        copy = dict(item)
+        copy.pop("remember_token", None)
+        safe_results.append(copy)
     with open(out, "w", encoding="utf-8") as fh:
-        json.dump(results, fh, ensure_ascii=False, indent=2)
+        json.dump(safe_results, fh, ensure_ascii=False, indent=2)
     return 1 if failed else 0
 
 
