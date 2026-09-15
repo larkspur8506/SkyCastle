@@ -1355,40 +1355,69 @@ def _sb_wait_challenge_gone(sb: Any, timeout: int = 15) -> bool:
 
 
 def _sb_fill_field(sb: Any, selectors: list[str], value: str, label: str) -> bool:
+    """Fill input and verify the value actually stuck (React/controlled inputs)."""
+    if not value:
+        log(f"fill {label}: empty value", "err")
+        return False
     for sel in selectors:
         try:
-            if sb.is_element_visible(sel):
+            if not sb.is_element_visible(sel):
+                continue
+            sb.wait_for_element_visible(sel, timeout=5)
+            try:
+                sb.click(sel)
+            except Exception:
+                pass
+            try:
                 sb.clear(sel)
+            except Exception:
+                pass
+            # human-like typing helps React controlled inputs
+            try:
                 sb.type(sel, value)
-                log(f"filled {label} via {sel}", "ok")
+            except Exception:
+                sb.execute_script(
+                    "arguments[0].value = arguments[1];"
+                    "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
+                    "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
+                    sb.find_element(sel),
+                    value,
+                )
+            time.sleep(0.3)
+            try:
+                got = sb.get_value(sel) or ""
+            except Exception:
+                got = sb.execute_script(
+                    "var e=document.querySelector(arguments[0]); return e?e.value:'';",
+                    sel,
+                ) or ""
+            if got == value or (len(got) >= max(1, len(value) - 1) and label != "password"):
+                log(f"filled {label} via {sel} (len={len(got)})", "ok")
                 return True
-        except Exception:
-            continue
-    # JS fallback
-    try:
-        hit = sb.execute_script(
-            """
-            var selectors = arguments[0], value = arguments[1];
-            for (var s = 0; s < selectors.length; s++) {
-                var el = null;
-                try { el = document.querySelector(selectors[s]); } catch (e) {}
-                if (!el) continue;
-                el.focus();
-                el.value = value;
+            # force native value setter for React
+            ok = sb.execute_script(
+                """
+                var sel = arguments[0], value = arguments[1];
+                var el = document.querySelector(sel);
+                if (!el) return false;
+                var proto = window.HTMLInputElement.prototype;
+                var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (desc && desc.set) desc.set.call(el, value); else el.value = value;
                 el.dispatchEvent(new Event('input', { bubbles: true }));
                 el.dispatchEvent(new Event('change', { bubbles: true }));
-                if (el.value === value) return selectors[s];
-            }
-            return null;
-            """,
-            selectors,
-            value,
-        )
-        if hit:
-            log(f"filled {label} via JS {hit}", "ok")
-            return True
-    except Exception as exc:  # noqa: BLE001
-        log(f"JS fill {label}: {exc}", "warn")
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
+                return el.value === value;
+                """,
+                sel,
+                value,
+            )
+            if ok:
+                log(f"filled {label} via React setter {sel}", "ok")
+                return True
+        except Exception as exc:  # noqa: BLE001
+            log(f"fill {label} try {sel}: {exc}", "info")
+            continue
+    log(f"unable to fill {label}", "err")
     return False
 
 
@@ -1464,16 +1493,35 @@ def _sb_browser_login(sb: Any, panel: str, email: str, password: str) -> bool:
     ]
     if not _sb_fill_field(sb, email_sels, email, "email"):
         return False
-    time.sleep(0.4)
+    time.sleep(0.5)
     if not _sb_fill_field(sb, pass_sels, password, "password"):
         return False
-    time.sleep(1)
-    # embedded Turnstile checkbox — click once (do NOT loop on widget text)
+    time.sleep(0.5)
+    # verify password not empty before submit
+    try:
+        plen = sb.execute_script(
+            """
+            var p = document.querySelector('input[type="password"]');
+            return p && p.value ? p.value.length : 0;
+            """
+        )
+        if not plen:
+            log("password still empty after fill — retry", "warn")
+            _sb_fill_field(sb, pass_sels, password, "password")
+            time.sleep(0.5)
+    except Exception:
+        pass
+
+    # embedded Turnstile checkbox — click once
     _sb_click_turnstile_once(sb)
     time.sleep(2)
 
     for attempt in range(4):
         log(f"browser Sign in click #{attempt + 1}", "info")
+        # re-ensure fields before each attempt (page may re-render)
+        _sb_fill_field(sb, email_sels, email, "email")
+        _sb_fill_field(sb, pass_sels, password, "password")
+        time.sleep(0.3)
         _sb_click_login(sb)
         time.sleep(4)
         if _sb_challenge_visible(sb):
@@ -1487,7 +1535,6 @@ def _sb_browser_login(sb: Any, panel: str, email: str, password: str) -> bool:
             if _sb_challenge_visible(sb):
                 _sb_handle_cloudflare(sb, max_retry=1)
             time.sleep(1)
-        # retry turnstile once between sign-in attempts
         if attempt < 3:
             _sb_click_turnstile_once(sb)
             time.sleep(2)
@@ -1671,6 +1718,47 @@ def browser_click_renew(
                     "before": before if os.path.isfile(before) else None,
                 }
 
+            # Expand folder / wait for server cards + RENEWAL to render
+            try:
+                # click Unassigned / folder if present
+                for label in ("Unassigned", "By Folder", "All Servers"):
+                    try:
+                        if sb.is_element_visible(f'span:contains("{label}")') or sb.is_element_visible(
+                            f'div:contains("{label}")'
+                        ):
+                            try:
+                                sb.click(f'div:contains("{label}")')
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                # scroll down so server cards load
+                for _ in range(4):
+                    sb.execute_script("window.scrollBy(0, 400);")
+                    time.sleep(0.6)
+                sb.execute_script("window.scrollTo(0, 0);")
+                time.sleep(1)
+                # wait up to ~20s for RENEWAL text
+                end = time.time() + 20
+                while time.time() < end:
+                    body = ""
+                    try:
+                        body = sb.get_text("body") or ""
+                    except Exception:
+                        try:
+                            body = sb.execute_script(
+                                "return document.body ? document.body.innerText : '';"
+                            ) or ""
+                        except Exception:
+                            body = ""
+                    if "RENEWAL" in body or "续期" in body or (server_name and server_name in body):
+                        log("server card / RENEWAL visible", "ok")
+                        break
+                    sb.execute_script("window.scrollBy(0, 300);")
+                    time.sleep(1.5)
+            except Exception as exc:  # noqa: BLE001
+                log(f"prepare servers UI: {exc}", "warn")
+
             _sb_save_shot(sb, before)
 
             # Find RENEWAL block / button state via JS (matches panel card UI)
@@ -1684,15 +1772,18 @@ def browser_click_renew(
                     var buttons = [];
                     var clickable = null;
                     var disabledFound = false;
-                    var nodes = document.querySelectorAll('button, a, [role="button"]');
+                    var nodes = document.querySelectorAll('button, a, [role="button"], div, span');
                     for (var i = 0; i < nodes.length; i++) {
                         var b = nodes[i];
                         var text = ((b.innerText || b.textContent || '') + ' ' +
                                     (b.getAttribute('aria-label') || '') + ' ' +
                                     (b.getAttribute('title') || '')).replace(/\\s+/g, ' ').trim();
+                        // skip huge containers
+                        if (text.length > 80) continue;
                         var low = text.toLowerCase();
                         var related = low.indexOf('renew') >= 0 || low.indexOf('credit') >= 0 ||
-                                      low.indexOf('续期') >= 0 || low.indexOf('renewal') >= 0;
+                                      low.indexOf('续期') >= 0 || low.indexOf('renewal') >= 0 ||
+                                      /\\d+\\s*credits?/.test(low);
                         if (!related) continue;
                         var vis = b.offsetParent !== null;
                         var dis = !!b.disabled ||
