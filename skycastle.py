@@ -225,31 +225,42 @@ class PanelClient:
         return ""
 
     def export_cookies_for_browser(self) -> list[dict[str, Any]]:
-        """Export urllib cookie jar for Playwright context.add_cookies()."""
-        host = urllib.parse.urlparse(self.base).hostname or "panel.skycastle.us"
+        """Export urllib cookie jar for Playwright context.add_cookies().
+
+        Prefer url= form (more reliable than domain=) so remember_token
+        is accepted on https://panel.skycastle.us.
+        """
+        base = self.base.rstrip("/")
+        host = urllib.parse.urlparse(base).hostname or "panel.skycastle.us"
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
         for c in self.jar:
             if not c.value:
                 continue
-            domain = (c.domain or host).lstrip(".")
-            key = f"{c.name}@{domain}"
+            key = f"{c.name}"
             if key in seen:
                 continue
             seen.add(key)
+            # url-based cookie (Playwright preferred)
             out.append(
                 {
                     "name": c.name,
                     "value": c.value,
-                    "domain": domain,
+                    "url": base + "/",
                     "path": c.path or "/",
-                    "secure": bool(getattr(c, "secure", True)) or True,
-                    "httpOnly": True,
-                    "sameSite": "Lax",
                 }
             )
         token = self.get_remember_token()
-        if token and not any(x["name"] == "remember_token" for x in out):
+        if token and "remember_token" not in seen:
+            out.append(
+                {
+                    "name": "remember_token",
+                    "value": token,
+                    "url": base + "/",
+                    "path": "/",
+                }
+            )
+            # also domain form as backup
             out.append(
                 {
                     "name": "remember_token",
@@ -961,35 +972,46 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
             "info",
         )
 
-        # 1) 服务器卡片「续期」：先试 API，失败则用浏览器点击 RENEWAL
+        # 1) 续期：直接打开 /dashboard/servers，看 RENEWAL 区域
+        #    可点击 → 点击续期；不可点击 → 跳过（不算失败）
         if do_renew and ident:
-            result = renew_server(client, ident, extra_ids=extra_ids)
-            if not result.get("ok"):
-                log(f"API renew miss → try browser click RENEWAL for {name}", "warn")
-                cookies = client.export_cookies_for_browser()
-                browser_result = browser_click_renew(
-                    panel=client.base,
-                    cookies=cookies,
-                    cache_dir=client.cache_dir,
-                    server_name=name,
-                )
-                if browser_result.get("ok"):
-                    result = browser_result
-                else:
-                    # keep API error but attach browser error
-                    result = {
-                        "ok": False,
-                        "error": (
-                            f"API: {result.get('error')}; "
-                            f"browser: {browser_result.get('error')}"
-                        )[:220],
-                        "code": browser_result.get("code") or result.get("code"),
-                        "probed": result.get("probed"),
-                        "before": browser_result.get("before"),
-                        "after": browser_result.get("after"),
-                    }
+            if not row.get("renewal_due_before") and srv.get("expires_at"):
+                row["renewal_due_before"] = srv.get("expires_at")
+            cookies = client.export_cookies_for_browser()
+            result = browser_click_renew(
+                panel=client.base,
+                cookies=cookies,
+                cache_dir=client.cache_dir,
+                server_name=name,
+            )
+            # optional: also try API if user set SKYCASTLE_RENEW_PATH
+            if (
+                not result.get("ok")
+                and not result.get("skipped")
+                and env("SKYCASTLE_RENEW_PATH")
+            ):
+                api_result = renew_server(client, ident, extra_ids=extra_ids)
+                if api_result.get("ok"):
+                    result = api_result
 
-            if result.get("ok"):
+            if result.get("ok") and result.get("skipped"):
+                report["actions"].append(f"renew {name} skipped (not clickable)")
+                report["renewals"].append(
+                    {
+                        "name": name,
+                        "id": ident,
+                        "ok": True,
+                        "skipped": True,
+                        "path": result.get("path"),
+                        "error": result.get("error"),
+                        "due_before": row["renewal_due_before"],
+                        "cost": row["renewal_cost"],
+                        "before": result.get("before"),
+                        "after": result.get("after"),
+                    }
+                )
+                log(f"· 续期跳过 {name}: {result.get('error')}", "info")
+            elif result.get("ok"):
                 row["renewed"] = True
                 report["actions"].append(f"renew {name} ok via {result.get('path')}")
                 log(f"✓ 续期完成 {name} via {result.get('path')}", "ok")
@@ -999,14 +1021,12 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
                         if data.get(k) is not None:
                             row["renewal_due_after"] = data.get(k)
                             break
-                # prefer expires_at from server object as due
-                if not row.get("renewal_due_before") and srv.get("expires_at"):
-                    row["renewal_due_before"] = srv.get("expires_at")
                 report["renewals"].append(
                     {
                         "name": name,
                         "id": ident,
                         "ok": True,
+                        "skipped": False,
                         "path": result.get("path"),
                         "due_before": row["renewal_due_before"],
                         "due_after": row["renewal_due_after"],
@@ -1028,7 +1048,6 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
                         "code": result.get("code"),
                         "due_before": row["renewal_due_before"] or srv.get("expires_at"),
                         "cost": row["renewal_cost"],
-                        "probed": result.get("probed"),
                         "before": result.get("before"),
                         "after": result.get("after"),
                     }
@@ -1184,7 +1203,12 @@ def format_report_html(results: list[dict[str, Any]]) -> str:
                 parts.append("<b>📅 续期结果</b>")
                 for r in renewals:
                     name = _html_escape(str(r.get("name") or "?"))
-                    if r.get("ok"):
+                    if r.get("ok") and r.get("skipped"):
+                        parts.append(
+                            f"⏭ <b>{name}</b> 续期跳过（按钮不可点）\n"
+                            f"   {_html_escape(str(r.get('error') or 'not clickable'))}"
+                        )
+                    elif r.get("ok"):
                         parts.append(
                             f"✅ <b>{name}</b> 续期成功\n"
                             f"   Due: <code>{_html_escape(str(r.get('due_before') or '-'))}</code>"
@@ -1294,7 +1318,6 @@ def _playwright_open_servers(
 
     panel = panel.rstrip("/")
     target = f"{panel}{path}"
-    host = urllib.parse.urlparse(panel).hostname or "panel.skycastle.us"
 
     pw = sync_playwright().start()
     browser = pw.chromium.launch(
@@ -1307,28 +1330,34 @@ def _playwright_open_servers(
         locale="zh-CN",
         color_scheme="dark",
     )
-    # Playwright requires a navigation before add_cookies on some versions —
-    # seed the domain first, then set cookies, then go to target.
     try:
         page = context.new_page()
+        # 1) seed origin so cookies stick
         page.goto(panel + "/", wait_until="domcontentloaded", timeout=60000)
         if cookies:
-            # also mirror under leading-dot domain
-            expanded = list(cookies)
-            for c in cookies:
-                d = dict(c)
-                dom = str(d.get("domain") or host).lstrip(".")
-                d["domain"] = f".{dom}"
-                expanded.append(d)
-            context.add_cookies(expanded)
-        page.goto(target, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(3500)
-        if "login" in (page.url or "").lower() or "/auth/" in (page.url or "").lower():
-            # one more cookie re-inject + navigate
-            if cookies:
+            # Playwright accepts url= cookies; ignore failures on domain= dupes
+            try:
                 context.add_cookies(cookies)
+            except Exception as exc:  # noqa: BLE001
+                log(f"add_cookies warn: {exc}", "warn")
+                # try one-by-one
+                for c in cookies:
+                    try:
+                        context.add_cookies([c])
+                    except Exception:
+                        pass
+        # 2) go to servers dashboard
+        page.goto(target, wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_timeout(4000)
+        if "login" in (page.url or "").lower() or "/auth/" in (page.url or "").lower():
+            log(f"browser still on auth ({page.url}), re-inject cookies…", "warn")
+            if cookies:
+                try:
+                    context.add_cookies(cookies)
+                except Exception:
+                    pass
             page.goto(target, wait_until="domcontentloaded", timeout=90000)
-            page.wait_for_timeout(3500)
+            page.wait_for_timeout(4000)
         return pw, browser, context, page, target
     except Exception:
         try:
@@ -1354,18 +1383,15 @@ def capture_panel_screenshot(
 
     Returns (absolute path to PNG or None, status message).
     """
-    host = urllib.parse.urlparse(panel.rstrip("/")).hostname or "panel.skycastle.us"
+    base = panel.rstrip("/")
     jar_cookies = list(cookies or [])
     if remember_token and not any(c.get("name") == "remember_token" for c in jar_cookies):
         jar_cookies.append(
             {
                 "name": "remember_token",
                 "value": remember_token,
-                "domain": host,
+                "url": base + "/",
                 "path": "/",
-                "secure": True,
-                "httpOnly": True,
-                "sameSite": "Lax",
             }
         )
     if not jar_cookies:
@@ -1396,7 +1422,6 @@ def capture_panel_screenshot(
         if "login" in (final_url or "").lower() or "/auth/" in (final_url or "").lower():
             msg = f"screenshot still on login page ({final_url}) — cookie auth failed for browser"
             log(msg, "warn")
-            # still send the image so user can see what happened
             if os.path.isfile(out) and os.path.getsize(out) > 2000:
                 return out, msg
             return None, msg
@@ -1419,9 +1444,10 @@ def browser_click_renew(
     cache_dir: str = ".skycastle-cache",
     server_name: str = "",
 ) -> dict[str, Any]:
-    """Use Playwright to click the RENEWAL button on /dashboard/servers.
+    """On /dashboard/servers: find the RENEWAL block (red area in UI).
 
-    Falls back when API renew routes do not exist (SkyCastle custom UI).
+    - If the renew control is **clickable** → click it (and confirm if needed).
+    - If **not clickable / disabled** → skip (not an error).
     """
     try:
         from playwright.sync_api import sync_playwright  # noqa: F401
@@ -1442,68 +1468,162 @@ def browser_click_renew(
                     "ok": False,
                     "error": f"browser on login page ({page.url})",
                     "code": "AUTH_FAILED",
+                    "before": None,
+                    "after": None,
                 }
+
             page.screenshot(path=before, full_page=True, type="png")
 
-            # Prefer button/link containing RENEWAL text near the server card
-            clicked = False
-            selectors = [
-                "button:has-text('RENEWAL')",
-                "button:has-text('Renewal')",
-                "button:has-text('续期')",
-                "a:has-text('RENEWAL')",
-                "[class*='renew' i]",
-                "text=RENEWAL",
-            ]
-            for sel in selectors:
+            # Scope to server card when name is known
+            root = page
+            if server_name:
                 try:
-                    loc = page.locator(sel)
-                    if loc.count() == 0:
-                        continue
-                    # if server_name known, prefer card that contains it
-                    target_loc = loc.first
-                    if server_name:
-                        card = page.locator(f"text={server_name}").first
-                        if card.count():
-                            near = card.locator("xpath=ancestor::*[.//button or .//a][1]")
-                            # fall back to first RENEWAL on page
-                            pass
-                    target_loc.click(timeout=5000)
-                    clicked = True
-                    log(f"clicked RENEWAL via selector {sel}", "ok")
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    log(f"renew click try {sel}: {exc}", "info")
+                    # card that contains the server name text
+                    card = page.locator(f"div:has-text('{server_name}')").filter(
+                        has_text="RENEWAL"
+                    ).first
+                    if card.count() > 0:
+                        root = card
+                except Exception:
+                    pass
+
+            # Locate RENEWAL label
+            renewal_label = root.get_by_text("RENEWAL", exact=False)
+            if renewal_label.count() == 0:
+                page.screenshot(path=after, full_page=True, type="png")
+                return {
+                    "ok": False,
+                    "skipped": True,
+                    "error": "RENEWAL section not found on page",
+                    "code": "NO_RENEWAL_UI",
+                    "before": before if os.path.isfile(before) else None,
+                    "after": after if os.path.isfile(after) else None,
+                }
+
+            # Find clickable control near RENEWAL:
+            # UI shows a row: RENEWAL | Due … | [ 1 credits · in 6h ]
+            # The gray bar / button with "credits" is the renew action when enabled.
+            candidates = []
+            for sel in (
+                "button:has-text('credit')",
+                "button:has-text('Credit')",
+                "button:has-text('续期')",
+                "button:has-text('RENEW')",
+                "[role='button']:has-text('credit')",
+                "a:has-text('credit')",
+                "button",
+            ):
+                try:
+                    loc = root.locator(sel)
+                    n = loc.count()
+                    for i in range(min(n, 8)):
+                        candidates.append(loc.nth(i))
+                except Exception:
                     continue
 
-            if not clicked:
-                # last resort: any element with text RENEWAL
-                try:
-                    page.get_by_text("RENEWAL", exact=False).first.click(timeout=5000)
-                    clicked = True
-                    log("clicked RENEWAL via get_by_text", "ok")
-                except Exception as exc:  # noqa: BLE001
-                    page.screenshot(path=after, full_page=True, type="png")
-                    return {
-                        "ok": False,
-                        "error": f"RENEWAL button not found: {exc}",
-                        "code": "NO_BUTTON",
-                        "before": before if os.path.isfile(before) else None,
-                        "after": after if os.path.isfile(after) else None,
-                    }
+            # Also try the parent row of the RENEWAL text for any button-like node
+            try:
+                row = renewal_label.first.locator(
+                    "xpath=ancestor::*[self::div or self::section][1]"
+                )
+                for sel in ("button", "[role='button']", "a", "[class*='renew' i]"):
+                    try:
+                        loc = row.locator(sel)
+                        for i in range(min(loc.count(), 6)):
+                            candidates.append(loc.nth(i))
+                    except Exception:
+                        continue
+            except Exception:
+                pass
 
-            page.wait_for_timeout(3000)
-            # confirm dialogs (OK / Confirm / 确认)
+            clickable = None
+            skip_reason = "RENEWAL control not clickable (disabled or not ready)"
+            for el in candidates:
+                try:
+                    if not el.is_visible():
+                        continue
+                    disabled = False
+                    try:
+                        disabled = bool(el.is_disabled())
+                    except Exception:
+                        disabled = False
+                    # aria-disabled / data-disabled
+                    try:
+                        aria = (el.get_attribute("aria-disabled") or "").lower()
+                        if aria in {"true", "1"}:
+                            disabled = True
+                    except Exception:
+                        pass
+                    try:
+                        cls = (el.get_attribute("class") or "").lower()
+                        if "disabled" in cls or "opacity-50" in cls or "cursor-not-allowed" in cls:
+                            disabled = True
+                    except Exception:
+                        pass
+                    if disabled:
+                        skip_reason = "RENEWAL button present but disabled — skip"
+                        continue
+                    # Must look related to renew/credits if it's a generic button
+                    try:
+                        txt = (el.inner_text(timeout=1000) or "").lower()
+                    except Exception:
+                        txt = ""
+                    if txt and not any(
+                        k in txt for k in ("credit", "renew", "续期", "renewal")
+                    ):
+                        # allow empty-text icon buttons inside renewal row only
+                        if "button" in str(el):
+                            continue
+                    clickable = el
+                    break
+                except Exception:
+                    continue
+
+            if clickable is None:
+                page.screenshot(path=after, full_page=True, type="png")
+                log(f"renew skip: {skip_reason}", "info")
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "path": "browser:RENEWAL-skip",
+                    "error": skip_reason,
+                    "code": "SKIP_NOT_CLICKABLE",
+                    "before": before if os.path.isfile(before) else None,
+                    "after": after if os.path.isfile(after) else None,
+                }
+
+            try:
+                clickable.click(timeout=8000)
+                log("clicked RENEWAL control on /dashboard/servers", "ok")
+            except Exception as exc:  # noqa: BLE001
+                page.screenshot(path=after, full_page=True, type="png")
+                return {
+                    "ok": False,
+                    "error": f"click failed: {exc}",
+                    "code": "CLICK_FAILED",
+                    "before": before if os.path.isfile(before) else None,
+                    "after": after if os.path.isfile(after) else None,
+                }
+
+            page.wait_for_timeout(2000)
+            # confirm dialog if any
             for confirm_sel in (
                 "button:has-text('Confirm')",
                 "button:has-text('OK')",
                 "button:has-text('确认')",
                 "button:has-text('续期')",
+                "button:has-text('Renew')",
                 "[role='dialog'] button:has-text('Confirm')",
+                "[role='dialog'] button:has-text('OK')",
             ):
                 try:
                     btn = page.locator(confirm_sel)
                     if btn.count() > 0 and btn.first.is_visible():
+                        try:
+                            if btn.first.is_disabled():
+                                continue
+                        except Exception:
+                            pass
                         btn.first.click(timeout=3000)
                         log(f"clicked confirm {confirm_sel}", "ok")
                         page.wait_for_timeout(2000)
@@ -1515,6 +1635,7 @@ def browser_click_renew(
             page.screenshot(path=after, full_page=True, type="png")
             return {
                 "ok": True,
+                "skipped": False,
                 "path": "browser:RENEWAL",
                 "before": before if os.path.isfile(before) else None,
                 "after": after if os.path.isfile(after) else None,
