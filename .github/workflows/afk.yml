@@ -24,10 +24,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install Playwright (real panel screenshots)
+      - name: Install SeleniumBase UC
         run: |
-          pip install --quiet playwright
-          playwright install --with-deps chromium
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb
+          pip install --quiet seleniumbase
+          seleniumbase get chromedriver || true
       - uses: actions/cache@v4
         with:
           path: .skycastle-cache
@@ -53,7 +55,8 @@ jobs:
           SKYCASTLE_MODE: afk
           SKYCASTLE_AFK_MINUTES: ${{ github.event.inputs.minutes || '10' }}
           PYTHONUNBUFFERED: "1"
-        run: python -u skycastle.py afk
+          DISPLAY: ":99"
+        run: xvfb-run -a python -u skycastle.py afk
       - if: always()
         uses: actions/cache/save@v4
         with:
