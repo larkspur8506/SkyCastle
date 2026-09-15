@@ -1280,234 +1280,299 @@ def _tg_api(token: str, method: str, fields: dict[str, Any], files: dict[str, tu
     urllib.request.urlopen(req, timeout=45).read()
 
 
+
+# ---------------------------------------------------------------------------
+# browser (SeleniumBase UC) — login + RENEWAL click + real screenshots
+# Mirrors skymc_renew.py Cloudflare Turnstile bypass via uc_gui_click_captcha
+# ---------------------------------------------------------------------------
+
 def _is_login_url(url: str) -> bool:
     u = (url or "").lower()
     return "login" in u or "/auth/" in u
 
 
-def _browser_fill_login(
-    page: Any,
-    panel: str,
-    email: str,
-    password: str,
-    site_key_hint: str = "",
-) -> None:
-    """Fill login form, solve Turnstile via CapSolver if needed, click Sign in."""
-    panel = panel.rstrip("/")
-    login_url = f"{panel}/auth/login"
-    if not _is_login_url(page.url or ""):
-        page.goto(login_url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(2000)
+def _sb_challenge_visible(sb: Any) -> bool:
+    try:
+        src = sb.get_page_source() or ""
+        markers = (
+            "Verify you are human",
+            "Security Verification",
+            "请验证您是真人",
+            "cf-turnstile",
+            "Checking if the site connection is secure",
+            "Just a moment",
+        )
+        return any(m in src for m in markers)
+    except Exception:
+        return False
 
-    # email / username
+
+def _sb_handle_cloudflare(sb: Any, max_retry: int = 4) -> bool:
+    """Click Cloudflare / Turnstile using SeleniumBase UC GUI helper (like skymc)."""
+    if not _sb_challenge_visible(sb):
+        return True
+    log("Cloudflare / Turnstile challenge detected — uc_gui_click_captcha…", "warn")
+    for i in range(max_retry):
+        log(f"captcha attempt {i + 1}/{max_retry}", "info")
+        try:
+            sb.uc_gui_click_captcha()
+            log("uc_gui_click_captcha called", "ok")
+            time.sleep(5)
+            if not _sb_challenge_visible(sb):
+                log("captcha passed", "ok")
+                return True
+        except Exception as exc:  # noqa: BLE001
+            log(f"uc_gui_click_captcha: {exc}", "warn")
+        time.sleep(2)
+    log("captcha may still be present — continue", "warn")
+    return False
+
+
+def _sb_wait_challenge_gone(sb: Any, timeout: int = 20) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if not _sb_challenge_visible(sb):
+            return True
+        _sb_handle_cloudflare(sb, max_retry=1)
+        time.sleep(1)
+    return not _sb_challenge_visible(sb)
+
+
+def _sb_fill_field(sb: Any, selectors: list[str], value: str, label: str) -> bool:
+    for sel in selectors:
+        try:
+            if sb.is_element_visible(sel):
+                sb.clear(sel)
+                sb.type(sel, value)
+                log(f"filled {label} via {sel}", "ok")
+                return True
+        except Exception:
+            continue
+    # JS fallback
+    try:
+        hit = sb.execute_script(
+            """
+            var selectors = arguments[0], value = arguments[1];
+            for (var s = 0; s < selectors.length; s++) {
+                var el = null;
+                try { el = document.querySelector(selectors[s]); } catch (e) {}
+                if (!el) continue;
+                el.focus();
+                el.value = value;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                if (el.value === value) return selectors[s];
+            }
+            return null;
+            """,
+            selectors,
+            value,
+        )
+        if hit:
+            log(f"filled {label} via JS {hit}", "ok")
+            return True
+    except Exception as exc:  # noqa: BLE001
+        log(f"JS fill {label}: {exc}", "warn")
+    return False
+
+
+def _sb_click_login(sb: Any) -> bool:
     for sel in (
+        'button:contains("Sign in")',
+        'button:contains("Sign In")',
+        'button:contains("Login")',
+        'button:contains("登录")',
+        'button[type="submit"]',
+    ):
+        try:
+            if sb.is_element_visible(sel):
+                try:
+                    sb.uc_click(sel)
+                except Exception:
+                    sb.click(sel)
+                log(f"clicked login {sel}", "ok")
+                return True
+        except Exception:
+            continue
+    try:
+        ok = sb.execute_script(
+            """
+            var btns = document.querySelectorAll('button');
+            for (var i = 0; i < btns.length; i++) {
+                var t = (btns[i].innerText || '').toLowerCase();
+                if (t.indexOf('sign in') >= 0 || t.indexOf('login') >= 0 || t.indexOf('登录') >= 0) {
+                    btns[i].click(); return true;
+                }
+            }
+            var s = document.querySelector('button[type="submit"]');
+            if (s) { s.click(); return true; }
+            return false;
+            """
+        )
+        if ok:
+            log("clicked login via JS", "ok")
+            return True
+    except Exception as exc:  # noqa: BLE001
+        log(f"login click failed: {exc}", "warn")
+    return False
+
+
+def _sb_browser_login(sb: Any, panel: str, email: str, password: str) -> bool:
+    """Full browser login with email/password + UC Turnstile click."""
+    login_url = panel.rstrip("/") + "/auth/login"
+    log(f"browser open login {login_url}", "info")
+    try:
+        sb.uc_open_with_reconnect(login_url, reconnect_time=6)
+    except Exception:
+        sb.open(login_url)
+    try:
+        sb.wait_for_ready_state_complete()
+    except Exception:
+        pass
+    time.sleep(3)
+    _sb_handle_cloudflare(sb)
+    time.sleep(1)
+
+    email_sels = [
         'input[type="email"]',
         'input[name="email"]',
         'input[name="username"]',
+        'input[name="username_or_email"]',
         'input[placeholder*="Email" i]',
         'input[placeholder*="Username" i]',
         'input[type="text"]',
-    ):
-        try:
-            loc = page.locator(sel).first
-            if loc.count() and loc.is_visible():
-                loc.fill(email)
-                break
-        except Exception:
-            continue
+    ]
+    pass_sels = [
+        'input[type="password"]',
+        'input[name="password"]',
+    ]
+    if not _sb_fill_field(sb, email_sels, email, "email"):
+        return False
+    time.sleep(0.4)
+    if not _sb_fill_field(sb, pass_sels, password, "password"):
+        return False
+    time.sleep(1)
+    _sb_handle_cloudflare(sb)
+    time.sleep(2)
 
-    # password
-    for sel in ('input[type="password"]', 'input[name="password"]'):
-        try:
-            loc = page.locator(sel).first
-            if loc.count() and loc.is_visible():
-                loc.fill(password)
-                break
-        except Exception:
-            continue
-
-    # Turnstile sitekey from DOM
-    site_key = site_key_hint or env("SKYCASTLE_TURNSTILE_SITEKEY") or ""
-    if not site_key:
-        try:
-            site_key = page.evaluate(
-                """() => {
-                  const el = document.querySelector('[data-sitekey], .cf-turnstile, [class*="turnstile"]');
-                  if (el && el.getAttribute('data-sitekey')) return el.getAttribute('data-sitekey');
-                  const scripts = [...document.scripts].map(s => s.src || s.textContent || '').join('\\n');
-                  const m = scripts.match(/0x[0-9A-Za-z_-]{10,}/);
-                  return m ? m[0] : '';
-                }"""
-            ) or ""
-        except Exception:
-            site_key = ""
-
-    capsolver = env("CAPSOLVER_KEY")
-    turnstile_token = ""
-    if capsolver and site_key:
-        try:
-            turnstile_token = solve_turnstile(site_key, login_url, capsolver)
-            log("browser Turnstile solved via Capsolver", "ok")
-        except Exception as exc:  # noqa: BLE001
-            log(f"browser Turnstile solve failed: {exc}", "warn")
-    elif not capsolver:
-        log("CAPSOLVER_KEY not set — cannot auto-solve Turnstile in browser", "warn")
-
-    if turnstile_token:
-        # inject token into typical hidden fields / callbacks
-        try:
-            page.evaluate(
-                """(token) => {
-                  const names = ['cf-turnstile-response', 'turnstile_token', 'g-recaptcha-response'];
-                  for (const n of names) {
-                    let inp = document.querySelector(`[name="${n}"]`);
-                    if (!inp) {
-                      inp = document.createElement('input');
-                      inp.type = 'hidden';
-                      inp.name = n;
-                      (document.querySelector('form') || document.body).appendChild(inp);
-                    }
-                    inp.value = token;
-                  }
-                  if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
-                    try { /* noop */ } catch (e) {}
-                  }
-                  // some SPAs store token on window
-                  window.__cf_turnstile_token = token;
-                  window.turnstileToken = token;
-                }""",
-                turnstile_token,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log(f"inject turnstile token: {exc}", "warn")
-
-    # click Sign in
-    clicked = False
-    for sel in (
-        'button:has-text("Sign in")',
-        'button:has-text("Sign In")',
-        'button:has-text("登录")',
-        'button[type="submit"]',
-        'button:has-text("Log in")',
-    ):
-        try:
-            btn = page.locator(sel).first
-            if btn.count() and btn.is_visible():
-                btn.click(timeout=5000)
-                clicked = True
-                log(f"clicked login button {sel}", "ok")
-                break
-        except Exception:
-            continue
-    if not clicked:
-        raise RuntimeError("login button not found")
-
-    page.wait_for_timeout(5000)
-    # wait for redirect off login
-    try:
-        page.wait_for_url("**/dashboard**", timeout=30000)
-    except Exception:
-        try:
-            page.wait_for_timeout(5000)
-        except Exception:
-            pass
+    for attempt in range(5):
+        log(f"browser Sign in click #{attempt + 1}", "info")
+        _sb_click_login(sb)
+        time.sleep(3)
+        if _sb_challenge_visible(sb):
+            _sb_handle_cloudflare(sb, max_retry=4)
+            time.sleep(3)
+        for _ in range(12):
+            url = (sb.get_current_url() or "").lower()
+            if not _is_login_url(url):
+                log(f"browser login ok → {sb.get_current_url()}", "ok")
+                return True
+            if _sb_challenge_visible(sb):
+                _sb_handle_cloudflare(sb, max_retry=2)
+            time.sleep(1)
+        time.sleep(2)
+    log(f"browser login failed, url={sb.get_current_url()}", "err")
+    return False
 
 
-def _playwright_open_servers(
+def _sb_open_servers(
+    sb: Any,
     panel: str,
-    cookies: list[dict[str, Any]],
-    path: str = "/dashboard/servers",
-    account: dict[str, str] | None = None,
-    site_key_hint: str = "",
-):
-    """Open authenticated servers page.
-
-    1) Try API cookies (if AFK/API already logged in).
-    2) If still on login page → fill email/password + Turnstile + Sign in.
-    Returns (playwright, browser, context, page, target).
-    """
-    from playwright.sync_api import sync_playwright  # type: ignore
-
+    cookies: list[dict[str, Any]] | None,
+    account: dict[str, str] | None,
+) -> bool:
+    """Open /dashboard/servers; reuse API cookies if possible, else browser login."""
     panel = panel.rstrip("/")
-    target = f"{panel}{path}"
+    target = panel + "/dashboard/servers"
     account = account or {}
 
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-    )
-    context = browser.new_context(
-        viewport={"width": 1400, "height": 1000},
-        user_agent=UA_DESKTOP,
-        locale="zh-CN",
-        color_scheme="dark",
-    )
+    # seed domain
     try:
-        page = context.new_page()
-        page.goto(panel + "/", wait_until="domcontentloaded", timeout=60000)
+        sb.uc_open_with_reconnect(panel + "/", reconnect_time=4)
+    except Exception:
+        sb.open(panel + "/")
+    time.sleep(1)
+    _sb_handle_cloudflare(sb, max_retry=2)
 
-        # inject cookies from API session (already logged in for AFK)
-        if cookies:
-            clean = []
+    # inject cookies from API session (AFK already logged in)
+    if cookies:
+        try:
             for c in cookies:
-                if not c.get("name") or not c.get("value"):
+                name = c.get("name")
+                value = c.get("value")
+                if not name or not value:
                     continue
-                # only url form — no path/domain mix
-                if c.get("url"):
-                    clean.append(
-                        {"name": c["name"], "value": str(c["value"]), "url": c["url"]}
-                    )
-                elif c.get("domain"):
-                    clean.append(
+                try:
+                    sb.driver.add_cookie(
                         {
-                            "name": c["name"],
-                            "value": str(c["value"]),
-                            "domain": str(c["domain"]).lstrip("."),
-                            "path": c.get("path") or "/",
+                            "name": name,
+                            "value": str(value),
+                            "path": "/",
+                            "domain": urlparse_host(panel),
                         }
                     )
-                else:
-                    clean.append(
-                        {"name": c["name"], "value": str(c["value"]), "url": panel + "/"}
-                    )
-            if clean:
-                try:
-                    context.add_cookies(clean)
-                    log(f"browser cookies injected: {len(clean)}", "ok")
-                except Exception as exc:  # noqa: BLE001
-                    log(f"add_cookies warn: {exc}", "warn")
-                    for c in clean:
-                        try:
-                            context.add_cookies([c])
-                        except Exception:
-                            pass
+                except Exception:
+                    try:
+                        sb.driver.add_cookie({"name": name, "value": str(value), "path": "/"})
+                    except Exception:
+                        pass
+            log(f"browser cookies injected: {len(cookies)}", "ok")
+        except Exception as exc:  # noqa: BLE001
+            log(f"cookie inject: {exc}", "warn")
 
-        page.goto(target, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(3500)
-
-        if _is_login_url(page.url or ""):
-            email = account.get("email") or env("SKYCASTLE_EMAIL") or ""
-            password = account.get("password") or env("SKYCASTLE_PASSWORD") or ""
-            if email and password:
-                log("browser needs login — filling form + Turnstile…", "warn")
-                _browser_fill_login(page, panel, email, password, site_key_hint=site_key_hint)
-                page.goto(target, wait_until="domcontentloaded", timeout=90000)
-                page.wait_for_timeout(3500)
-            else:
-                log("browser on login page and no email/password available", "err")
-
-        return pw, browser, context, page, target
+    try:
+        sb.uc_open_with_reconnect(target, reconnect_time=5)
     except Exception:
+        sb.open(target)
+    try:
+        sb.wait_for_ready_state_complete()
+    except Exception:
+        pass
+    time.sleep(3)
+    _sb_handle_cloudflare(sb)
+    _sb_wait_challenge_gone(sb, timeout=12)
+
+    if _is_login_url(sb.get_current_url() or ""):
+        email = account.get("email") or env("SKYCASTLE_EMAIL") or ""
+        password = account.get("password") or env("SKYCASTLE_PASSWORD") or ""
+        if not email or not password:
+            log("on login page and no email/password", "err")
+            return False
+        log("API cookies not enough — browser login with email/password + Turnstile", "warn")
+        if not _sb_browser_login(sb, panel, email, password):
+            return False
         try:
-            browser.close()
+            sb.uc_open_with_reconnect(target, reconnect_time=5)
         except Exception:
-            pass
-        try:
-            pw.stop()
-        except Exception:
-            pass
-        raise
+            sb.open(target)
+        time.sleep(3)
+        _sb_handle_cloudflare(sb)
+        _sb_wait_challenge_gone(sb, timeout=12)
+        if _is_login_url(sb.get_current_url() or ""):
+            log("still on login after browser auth", "err")
+            return False
+    else:
+        log("already authenticated in browser — skip login", "ok")
+
+    log(f"on servers page: {sb.get_current_url()}", "ok")
+    return True
+
+
+def urlparse_host(url: str) -> str:
+    return urllib.parse.urlparse(url).hostname or "panel.skycastle.us"
+
+
+def _sb_save_shot(sb: Any, path: str) -> str | None:
+    try:
+        _sb_wait_challenge_gone(sb, timeout=10)
+        time.sleep(0.8)
+        sb.save_screenshot(path)
+        if os.path.isfile(path) and os.path.getsize(path) > 1000:
+            log(f"screenshot → {path} ({os.path.getsize(path)} bytes)", "ok")
+            return path
+    except Exception as exc:  # noqa: BLE001
+        log(f"screenshot failed: {exc}", "warn")
+    return None
 
 
 def capture_panel_screenshot(
@@ -1519,54 +1584,38 @@ def capture_panel_screenshot(
     cookies: list[dict[str, Any]] | None = None,
     account: dict[str, str] | None = None,
 ) -> tuple[str | None, str]:
-    """Real browser screenshot of /dashboard/servers.
-
-    Reuses API cookies when available; otherwise browser login (email/password + Turnstile).
-    """
-    base = panel.rstrip("/")
-    jar_cookies = list(cookies or [])
-    if remember_token and not any(c.get("name") == "remember_token" for c in jar_cookies):
-        jar_cookies.append(
-            {"name": "remember_token", "value": remember_token, "url": base + "/"}
-        )
+    """Real screenshot of dashboard/servers via SeleniumBase UC."""
     try:
-        from playwright.sync_api import sync_playwright  # noqa: F401
+        from seleniumbase import SB  # type: ignore
     except ImportError:
-        msg = (
-            "screenshot skipped: playwright not installed "
-            "(pip install playwright && playwright install --with-deps chromium)"
-        )
+        msg = "seleniumbase not installed (pip install seleniumbase)"
         log(msg, "warn")
         return None, msg
 
     os.makedirs(cache_dir, exist_ok=True)
     out = os.path.abspath(os.path.join(cache_dir, filename))
+    jar = list(cookies or [])
+    if remember_token and not any(c.get("name") == "remember_token" for c in jar):
+        jar.append(
+            {
+                "name": "remember_token",
+                "value": remember_token,
+                "url": panel.rstrip("/") + "/",
+            }
+        )
 
     try:
-        pw, browser, context, page, _target = _playwright_open_servers(
-            panel, jar_cookies, path, account=account or {}
-        )
-        try:
-            page.screenshot(path=out, full_page=True, type="png")
-            final_url = page.url
-        finally:
-            browser.close()
-            pw.stop()
-        if _is_login_url(final_url or ""):
-            msg = f"screenshot still on login page ({final_url})"
-            log(msg, "warn")
-            if os.path.isfile(out) and os.path.getsize(out) > 2000:
-                return out, msg
-            return None, msg
-        if os.path.isfile(out) and os.path.getsize(out) > 2000:
-            msg = f"panel screenshot ok → {out} ({os.path.getsize(out)} bytes) url={final_url}"
-            log(msg, "ok")
-            return out, msg
-        msg = f"screenshot file missing or too small: {out}"
-        log(msg, "warn")
-        return None, msg
+        # headless=False required for uc_gui_click_captcha (use xvfb on GHA)
+        with SB(uc=True, headless=False, locale_code="zh-CN") as sb:
+            ok = _sb_open_servers(sb, panel, jar, account or {})
+            shot = _sb_save_shot(sb, out)
+            if not ok:
+                return shot, f"browser auth failed url={sb.get_current_url()}"
+            if shot:
+                return shot, f"ok url={sb.get_current_url()}"
+            return None, "screenshot empty"
     except Exception as exc:  # noqa: BLE001
-        msg = f"playwright screenshot failed: {exc}"
+        msg = f"seleniumbase screenshot failed: {exc}"
         log(msg, "warn")
         return None, msg
 
@@ -1578,195 +1627,196 @@ def browser_click_renew(
     server_name: str = "",
     account: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """On /dashboard/servers: find the RENEWAL block (red area in UI).
+    """Open /dashboard/servers; click RENEWAL if enabled, else skip.
 
-    - If the renew control is **clickable** → click it (and confirm if needed).
-    - If **not clickable / disabled** → skip (not an error).
+    Uses SeleniumBase UC + uc_gui_click_captcha (same idea as skymc_renew.py).
     """
     try:
-        from playwright.sync_api import sync_playwright  # noqa: F401
+        from seleniumbase import SB  # type: ignore
     except ImportError:
-        return {"ok": False, "error": "playwright not installed", "code": "NO_PLAYWRIGHT"}
+        return {"ok": False, "error": "seleniumbase not installed", "code": "NO_SB"}
 
     os.makedirs(cache_dir, exist_ok=True)
     before = os.path.abspath(os.path.join(cache_dir, "renew-before.png"))
     after = os.path.abspath(os.path.join(cache_dir, "renew-after.png"))
 
     try:
-        pw, browser, context, page, _ = _playwright_open_servers(
-            panel, cookies, "/dashboard/servers", account=account or {}
-        )
-        try:
-            if _is_login_url(page.url or ""):
+        with SB(uc=True, headless=False, locale_code="zh-CN") as sb:
+            if not _sb_open_servers(sb, panel, cookies, account or {}):
+                _sb_save_shot(sb, before)
                 return {
                     "ok": False,
-                    "error": f"browser on login page ({page.url})",
+                    "error": f"browser on login page ({sb.get_current_url()})",
                     "code": "AUTH_FAILED",
-                    "before": None,
-                    "after": None,
+                    "before": before if os.path.isfile(before) else None,
                 }
 
-            page.screenshot(path=before, full_page=True, type="png")
+            _sb_save_shot(sb, before)
 
-            # Scope to server card when name is known
-            root = page
-            if server_name:
-                try:
-                    # card that contains the server name text
-                    card = page.locator(f"div:has-text('{server_name}')").filter(
-                        has_text="RENEWAL"
-                    ).first
-                    if card.count() > 0:
-                        root = card
-                except Exception:
-                    pass
+            # Find RENEWAL block / button state via JS (matches panel card UI)
+            info = {}
+            try:
+                info = sb.execute_script(
+                    """
+                    var serverName = arguments[0] || '';
+                    var body = document.body ? document.body.innerText : '';
+                    var hasRenewal = body.indexOf('RENEWAL') >= 0 || body.indexOf('续期') >= 0;
+                    var buttons = [];
+                    var clickable = null;
+                    var disabledFound = false;
+                    var nodes = document.querySelectorAll('button, a, [role="button"]');
+                    for (var i = 0; i < nodes.length; i++) {
+                        var b = nodes[i];
+                        var text = ((b.innerText || b.textContent || '') + ' ' +
+                                    (b.getAttribute('aria-label') || '') + ' ' +
+                                    (b.getAttribute('title') || '')).replace(/\\s+/g, ' ').trim();
+                        var low = text.toLowerCase();
+                        var related = low.indexOf('renew') >= 0 || low.indexOf('credit') >= 0 ||
+                                      low.indexOf('续期') >= 0 || low.indexOf('renewal') >= 0;
+                        if (!related) continue;
+                        var vis = b.offsetParent !== null;
+                        var dis = !!b.disabled ||
+                                  (b.getAttribute('aria-disabled') || '') === 'true' ||
+                                  (b.className || '').toLowerCase().indexOf('disabled') >= 0 ||
+                                  (b.className || '').toLowerCase().indexOf('cursor-not-allowed') >= 0;
+                        buttons.push({text: text, disabled: dis, visible: vis});
+                        if (!vis) continue;
+                        if (dis) { disabledFound = true; continue; }
+                        if (!clickable) clickable = b;
+                    }
+                    // also scan near RENEWAL label for a credits bar/button
+                    if (!clickable) {
+                        var labels = Array.prototype.slice.call(document.querySelectorAll('*'))
+                            .filter(function(el) {
+                                var t = (el.childNodes && el.childNodes.length === 1 && el.textContent || '');
+                                return t && (t.indexOf('RENEWAL') >= 0 || t.indexOf('续期') >= 0);
+                            });
+                        for (var j = 0; j < labels.length; j++) {
+                            var row = labels[j].closest('div, section, li, article') || labels[j].parentElement;
+                            if (!row) continue;
+                            var cand = row.querySelectorAll('button, a, [role="button"], div[class*="cursor"]');
+                            for (var k = 0; k < cand.length; k++) {
+                                var el = cand[k];
+                                if (el.offsetParent === null) continue;
+                                var dis2 = !!el.disabled ||
+                                    (el.getAttribute('aria-disabled') || '') === 'true' ||
+                                    (el.className || '').toLowerCase().indexOf('disabled') >= 0 ||
+                                    (el.className || '').toLowerCase().indexOf('opacity') >= 0;
+                                var t2 = (el.innerText || '').toLowerCase();
+                                if (t2.indexOf('credit') >= 0 || t2.indexOf('renew') >= 0 || t2.indexOf('续期') >= 0) {
+                                    if (dis2) { disabledFound = true; continue; }
+                                    clickable = el; break;
+                                }
+                            }
+                            if (clickable) break;
+                        }
+                    }
+                    if (clickable) {
+                        clickable.setAttribute('data-skycastlereew', '1');
+                    }
+                    return {
+                        hasRenewal: hasRenewal,
+                        disabledFound: disabledFound,
+                        canClick: !!clickable,
+                        buttons: buttons.slice(0, 12)
+                    };
+                    """,
+                    server_name or "",
+                )
+            except Exception as exc:  # noqa: BLE001
+                log(f"renew DOM scan: {exc}", "warn")
+                info = {}
 
-            # Locate RENEWAL label
-            renewal_label = root.get_by_text("RENEWAL", exact=False)
-            if renewal_label.count() == 0:
-                page.screenshot(path=after, full_page=True, type="png")
+            log(f"RENEWAL scan: {json.dumps(info, ensure_ascii=False)[:400]}", "info")
+
+            if not info.get("hasRenewal") and not info.get("canClick"):
+                _sb_save_shot(sb, after)
                 return {
-                    "ok": False,
+                    "ok": True,
                     "skipped": True,
-                    "error": "RENEWAL section not found on page",
+                    "path": "browser:RENEWAL-skip",
+                    "error": "RENEWAL section not found",
                     "code": "NO_RENEWAL_UI",
                     "before": before if os.path.isfile(before) else None,
                     "after": after if os.path.isfile(after) else None,
                 }
 
-            # Find clickable control near RENEWAL:
-            # UI shows a row: RENEWAL | Due … | [ 1 credits · in 6h ]
-            # The gray bar / button with "credits" is the renew action when enabled.
-            candidates = []
-            for sel in (
-                "button:has-text('credit')",
-                "button:has-text('Credit')",
-                "button:has-text('续期')",
-                "button:has-text('RENEW')",
-                "[role='button']:has-text('credit')",
-                "a:has-text('credit')",
-                "button",
-            ):
-                try:
-                    loc = root.locator(sel)
-                    n = loc.count()
-                    for i in range(min(n, 8)):
-                        candidates.append(loc.nth(i))
-                except Exception:
-                    continue
-
-            # Also try the parent row of the RENEWAL text for any button-like node
-            try:
-                row = renewal_label.first.locator(
-                    "xpath=ancestor::*[self::div or self::section][1]"
-                )
-                for sel in ("button", "[role='button']", "a", "[class*='renew' i]"):
-                    try:
-                        loc = row.locator(sel)
-                        for i in range(min(loc.count(), 6)):
-                            candidates.append(loc.nth(i))
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-
-            clickable = None
-            skip_reason = "RENEWAL control not clickable (disabled or not ready)"
-            for el in candidates:
-                try:
-                    if not el.is_visible():
-                        continue
-                    disabled = False
-                    try:
-                        disabled = bool(el.is_disabled())
-                    except Exception:
-                        disabled = False
-                    # aria-disabled / data-disabled
-                    try:
-                        aria = (el.get_attribute("aria-disabled") or "").lower()
-                        if aria in {"true", "1"}:
-                            disabled = True
-                    except Exception:
-                        pass
-                    try:
-                        cls = (el.get_attribute("class") or "").lower()
-                        if "disabled" in cls or "opacity-50" in cls or "cursor-not-allowed" in cls:
-                            disabled = True
-                    except Exception:
-                        pass
-                    if disabled:
-                        skip_reason = "RENEWAL button present but disabled — skip"
-                        continue
-                    # Must look related to renew/credits if it's a generic button
-                    try:
-                        txt = (el.inner_text(timeout=1000) or "").lower()
-                    except Exception:
-                        txt = ""
-                    if txt and not any(
-                        k in txt for k in ("credit", "renew", "续期", "renewal")
-                    ):
-                        # allow empty-text icon buttons inside renewal row only
-                        if "button" in str(el):
-                            continue
-                    clickable = el
-                    break
-                except Exception:
-                    continue
-
-            if clickable is None:
-                page.screenshot(path=after, full_page=True, type="png")
-                log(f"renew skip: {skip_reason}", "info")
+            if not info.get("canClick"):
+                _sb_save_shot(sb, after)
+                reason = "RENEWAL present but not clickable — skip"
+                log(reason, "info")
                 return {
                     "ok": True,
                     "skipped": True,
                     "path": "browser:RENEWAL-skip",
-                    "error": skip_reason,
+                    "error": reason,
                     "code": "SKIP_NOT_CLICKABLE",
                     "before": before if os.path.isfile(before) else None,
                     "after": after if os.path.isfile(after) else None,
                 }
 
+            # click marked element
+            clicked = False
             try:
-                clickable.click(timeout=8000)
-                log("clicked RENEWAL control on /dashboard/servers", "ok")
+                clicked = bool(
+                    sb.execute_script(
+                        """
+                        var el = document.querySelector('[data-skycastlereew="1"]');
+                        if (!el) return false;
+                        el.click();
+                        return true;
+                        """
+                    )
+                )
             except Exception as exc:  # noqa: BLE001
-                page.screenshot(path=after, full_page=True, type="png")
+                log(f"renew click JS: {exc}", "warn")
+
+            if not clicked:
+                for name in ("Renew", "RENEWAL", "续期", "credit", "Credit"):
+                    sel = f'button:contains("{name}")'
+                    try:
+                        if sb.is_element_visible(sel) and sb.is_element_enabled(sel):
+                            try:
+                                sb.uc_click(sel)
+                            except Exception:
+                                sb.click(sel)
+                            clicked = True
+                            log(f"clicked renew via {sel}", "ok")
+                            break
+                    except Exception:
+                        continue
+
+            if not clicked:
+                _sb_save_shot(sb, after)
                 return {
                     "ok": False,
-                    "error": f"click failed: {exc}",
+                    "error": "RENEWAL was marked clickable but click failed",
                     "code": "CLICK_FAILED",
                     "before": before if os.path.isfile(before) else None,
                     "after": after if os.path.isfile(after) else None,
                 }
 
-            page.wait_for_timeout(2000)
-            # confirm dialog if any
-            for confirm_sel in (
-                "button:has-text('Confirm')",
-                "button:has-text('OK')",
-                "button:has-text('确认')",
-                "button:has-text('续期')",
-                "button:has-text('Renew')",
-                "[role='dialog'] button:has-text('Confirm')",
-                "[role='dialog'] button:has-text('OK')",
-            ):
+            log("clicked RENEWAL on /dashboard/servers", "ok")
+            time.sleep(2)
+            if _sb_challenge_visible(sb):
+                _sb_handle_cloudflare(sb, max_retry=3)
+            # confirm dialogs
+            for name in ("Confirm", "OK", "确认", "续期", "Renew"):
+                sel = f'button:contains("{name}")'
                 try:
-                    btn = page.locator(confirm_sel)
-                    if btn.count() > 0 and btn.first.is_visible():
+                    if sb.is_element_visible(sel) and sb.is_element_enabled(sel):
                         try:
-                            if btn.first.is_disabled():
-                                continue
+                            sb.uc_click(sel)
                         except Exception:
-                            pass
-                        btn.first.click(timeout=3000)
-                        log(f"clicked confirm {confirm_sel}", "ok")
-                        page.wait_for_timeout(2000)
+                            sb.click(sel)
+                        log(f"clicked confirm {name}", "ok")
+                        time.sleep(2)
                         break
                 except Exception:
                     continue
-
-            page.wait_for_timeout(2000)
-            page.screenshot(path=after, full_page=True, type="png")
+            time.sleep(2)
+            _sb_wait_challenge_gone(sb, timeout=10)
+            _sb_save_shot(sb, after)
             return {
                 "ok": True,
                 "skipped": False,
@@ -1774,11 +1824,9 @@ def browser_click_renew(
                 "before": before if os.path.isfile(before) else None,
                 "after": after if os.path.isfile(after) else None,
             }
-        finally:
-            browser.close()
-            pw.stop()
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)[:200], "code": "BROWSER_ERROR"}
+
 
 
 def notify(
