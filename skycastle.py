@@ -225,53 +225,24 @@ class PanelClient:
         return ""
 
     def export_cookies_for_browser(self) -> list[dict[str, Any]]:
-        """Export urllib cookie jar for Playwright context.add_cookies().
+        """Export urllib cookie jar for Playwright.
 
-        Prefer url= form (more reliable than domain=) so remember_token
-        is accepted on https://panel.skycastle.us.
+        Rule: each cookie must have either `url` OR (`domain` + `path`).
+        Never set `url` together with `path`/`domain`.
         """
         base = self.base.rstrip("/")
-        host = urllib.parse.urlparse(base).hostname or "panel.skycastle.us"
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
         for c in self.jar:
             if not c.value:
                 continue
-            key = f"{c.name}"
-            if key in seen:
+            if c.name in seen:
                 continue
-            seen.add(key)
-            # url-based cookie (Playwright preferred)
-            out.append(
-                {
-                    "name": c.name,
-                    "value": c.value,
-                    "url": base + "/",
-                    "path": c.path or "/",
-                }
-            )
+            seen.add(c.name)
+            out.append({"name": c.name, "value": str(c.value), "url": base + "/"})
         token = self.get_remember_token()
         if token and "remember_token" not in seen:
-            out.append(
-                {
-                    "name": "remember_token",
-                    "value": token,
-                    "url": base + "/",
-                    "path": "/",
-                }
-            )
-            # also domain form as backup
-            out.append(
-                {
-                    "name": "remember_token",
-                    "value": token,
-                    "domain": host,
-                    "path": "/",
-                    "secure": True,
-                    "httpOnly": True,
-                    "sameSite": "Lax",
-                }
-            )
+            out.append({"name": "remember_token", "value": token, "url": base + "/"})
         return out
 
     def request(
@@ -983,6 +954,7 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
                 cookies=cookies,
                 cache_dir=client.cache_dir,
                 server_name=name,
+                account=account,
             )
             # optional: also try API if user set SKYCASTLE_RENEW_PATH
             if (
@@ -1308,16 +1280,157 @@ def _tg_api(token: str, method: str, fields: dict[str, Any], files: dict[str, tu
     urllib.request.urlopen(req, timeout=45).read()
 
 
+def _is_login_url(url: str) -> bool:
+    u = (url or "").lower()
+    return "login" in u or "/auth/" in u
+
+
+def _browser_fill_login(
+    page: Any,
+    panel: str,
+    email: str,
+    password: str,
+    site_key_hint: str = "",
+) -> None:
+    """Fill login form, solve Turnstile via CapSolver if needed, click Sign in."""
+    panel = panel.rstrip("/")
+    login_url = f"{panel}/auth/login"
+    if not _is_login_url(page.url or ""):
+        page.goto(login_url, wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_timeout(2000)
+
+    # email / username
+    for sel in (
+        'input[type="email"]',
+        'input[name="email"]',
+        'input[name="username"]',
+        'input[placeholder*="Email" i]',
+        'input[placeholder*="Username" i]',
+        'input[type="text"]',
+    ):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() and loc.is_visible():
+                loc.fill(email)
+                break
+        except Exception:
+            continue
+
+    # password
+    for sel in ('input[type="password"]', 'input[name="password"]'):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() and loc.is_visible():
+                loc.fill(password)
+                break
+        except Exception:
+            continue
+
+    # Turnstile sitekey from DOM
+    site_key = site_key_hint or env("SKYCASTLE_TURNSTILE_SITEKEY") or ""
+    if not site_key:
+        try:
+            site_key = page.evaluate(
+                """() => {
+                  const el = document.querySelector('[data-sitekey], .cf-turnstile, [class*="turnstile"]');
+                  if (el && el.getAttribute('data-sitekey')) return el.getAttribute('data-sitekey');
+                  const scripts = [...document.scripts].map(s => s.src || s.textContent || '').join('\\n');
+                  const m = scripts.match(/0x[0-9A-Za-z_-]{10,}/);
+                  return m ? m[0] : '';
+                }"""
+            ) or ""
+        except Exception:
+            site_key = ""
+
+    capsolver = env("CAPSOLVER_KEY")
+    turnstile_token = ""
+    if capsolver and site_key:
+        try:
+            turnstile_token = solve_turnstile(site_key, login_url, capsolver)
+            log("browser Turnstile solved via Capsolver", "ok")
+        except Exception as exc:  # noqa: BLE001
+            log(f"browser Turnstile solve failed: {exc}", "warn")
+    elif not capsolver:
+        log("CAPSOLVER_KEY not set — cannot auto-solve Turnstile in browser", "warn")
+
+    if turnstile_token:
+        # inject token into typical hidden fields / callbacks
+        try:
+            page.evaluate(
+                """(token) => {
+                  const names = ['cf-turnstile-response', 'turnstile_token', 'g-recaptcha-response'];
+                  for (const n of names) {
+                    let inp = document.querySelector(`[name="${n}"]`);
+                    if (!inp) {
+                      inp = document.createElement('input');
+                      inp.type = 'hidden';
+                      inp.name = n;
+                      (document.querySelector('form') || document.body).appendChild(inp);
+                    }
+                    inp.value = token;
+                  }
+                  if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                    try { /* noop */ } catch (e) {}
+                  }
+                  // some SPAs store token on window
+                  window.__cf_turnstile_token = token;
+                  window.turnstileToken = token;
+                }""",
+                turnstile_token,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log(f"inject turnstile token: {exc}", "warn")
+
+    # click Sign in
+    clicked = False
+    for sel in (
+        'button:has-text("Sign in")',
+        'button:has-text("Sign In")',
+        'button:has-text("登录")',
+        'button[type="submit"]',
+        'button:has-text("Log in")',
+    ):
+        try:
+            btn = page.locator(sel).first
+            if btn.count() and btn.is_visible():
+                btn.click(timeout=5000)
+                clicked = True
+                log(f"clicked login button {sel}", "ok")
+                break
+        except Exception:
+            continue
+    if not clicked:
+        raise RuntimeError("login button not found")
+
+    page.wait_for_timeout(5000)
+    # wait for redirect off login
+    try:
+        page.wait_for_url("**/dashboard**", timeout=30000)
+    except Exception:
+        try:
+            page.wait_for_timeout(5000)
+        except Exception:
+            pass
+
+
 def _playwright_open_servers(
     panel: str,
     cookies: list[dict[str, Any]],
     path: str = "/dashboard/servers",
+    account: dict[str, str] | None = None,
+    site_key_hint: str = "",
 ):
-    """Open authenticated servers page. Returns (playwright, browser, context, page) or raises."""
+    """Open authenticated servers page.
+
+    1) Try API cookies (if AFK/API already logged in).
+    2) If still on login page → fill email/password + Turnstile + Sign in.
+    Returns (playwright, browser, context, page, target).
+    """
     from playwright.sync_api import sync_playwright  # type: ignore
 
     panel = panel.rstrip("/")
     target = f"{panel}{path}"
+    account = account or {}
 
     pw = sync_playwright().start()
     browser = pw.chromium.launch(
@@ -1332,32 +1445,58 @@ def _playwright_open_servers(
     )
     try:
         page = context.new_page()
-        # 1) seed origin so cookies stick
         page.goto(panel + "/", wait_until="domcontentloaded", timeout=60000)
+
+        # inject cookies from API session (already logged in for AFK)
         if cookies:
-            # Playwright accepts url= cookies; ignore failures on domain= dupes
-            try:
-                context.add_cookies(cookies)
-            except Exception as exc:  # noqa: BLE001
-                log(f"add_cookies warn: {exc}", "warn")
-                # try one-by-one
-                for c in cookies:
-                    try:
-                        context.add_cookies([c])
-                    except Exception:
-                        pass
-        # 2) go to servers dashboard
-        page.goto(target, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(4000)
-        if "login" in (page.url or "").lower() or "/auth/" in (page.url or "").lower():
-            log(f"browser still on auth ({page.url}), re-inject cookies…", "warn")
-            if cookies:
+            clean = []
+            for c in cookies:
+                if not c.get("name") or not c.get("value"):
+                    continue
+                # only url form — no path/domain mix
+                if c.get("url"):
+                    clean.append(
+                        {"name": c["name"], "value": str(c["value"]), "url": c["url"]}
+                    )
+                elif c.get("domain"):
+                    clean.append(
+                        {
+                            "name": c["name"],
+                            "value": str(c["value"]),
+                            "domain": str(c["domain"]).lstrip("."),
+                            "path": c.get("path") or "/",
+                        }
+                    )
+                else:
+                    clean.append(
+                        {"name": c["name"], "value": str(c["value"]), "url": panel + "/"}
+                    )
+            if clean:
                 try:
-                    context.add_cookies(cookies)
-                except Exception:
-                    pass
-            page.goto(target, wait_until="domcontentloaded", timeout=90000)
-            page.wait_for_timeout(4000)
+                    context.add_cookies(clean)
+                    log(f"browser cookies injected: {len(clean)}", "ok")
+                except Exception as exc:  # noqa: BLE001
+                    log(f"add_cookies warn: {exc}", "warn")
+                    for c in clean:
+                        try:
+                            context.add_cookies([c])
+                        except Exception:
+                            pass
+
+        page.goto(target, wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_timeout(3500)
+
+        if _is_login_url(page.url or ""):
+            email = account.get("email") or env("SKYCASTLE_EMAIL") or ""
+            password = account.get("password") or env("SKYCASTLE_PASSWORD") or ""
+            if email and password:
+                log("browser needs login — filling form + Turnstile…", "warn")
+                _browser_fill_login(page, panel, email, password, site_key_hint=site_key_hint)
+                page.goto(target, wait_until="domcontentloaded", timeout=90000)
+                page.wait_for_timeout(3500)
+            else:
+                log("browser on login page and no email/password available", "err")
+
         return pw, browser, context, page, target
     except Exception:
         try:
@@ -1378,26 +1517,18 @@ def capture_panel_screenshot(
     path: str = "/dashboard/servers",
     filename: str = "panel-servers.png",
     cookies: list[dict[str, Any]] | None = None,
+    account: dict[str, str] | None = None,
 ) -> tuple[str | None, str]:
-    """Real browser screenshot of the panel page (requires playwright + chromium).
+    """Real browser screenshot of /dashboard/servers.
 
-    Returns (absolute path to PNG or None, status message).
+    Reuses API cookies when available; otherwise browser login (email/password + Turnstile).
     """
     base = panel.rstrip("/")
     jar_cookies = list(cookies or [])
     if remember_token and not any(c.get("name") == "remember_token" for c in jar_cookies):
         jar_cookies.append(
-            {
-                "name": "remember_token",
-                "value": remember_token,
-                "url": base + "/",
-                "path": "/",
-            }
+            {"name": "remember_token", "value": remember_token, "url": base + "/"}
         )
-    if not jar_cookies:
-        msg = "screenshot skipped: no cookies / remember_token"
-        log(msg, "warn")
-        return None, msg
     try:
         from playwright.sync_api import sync_playwright  # noqa: F401
     except ImportError:
@@ -1412,15 +1543,17 @@ def capture_panel_screenshot(
     out = os.path.abspath(os.path.join(cache_dir, filename))
 
     try:
-        pw, browser, context, page, _target = _playwright_open_servers(panel, jar_cookies, path)
+        pw, browser, context, page, _target = _playwright_open_servers(
+            panel, jar_cookies, path, account=account or {}
+        )
         try:
             page.screenshot(path=out, full_page=True, type="png")
             final_url = page.url
         finally:
             browser.close()
             pw.stop()
-        if "login" in (final_url or "").lower() or "/auth/" in (final_url or "").lower():
-            msg = f"screenshot still on login page ({final_url}) — cookie auth failed for browser"
+        if _is_login_url(final_url or ""):
+            msg = f"screenshot still on login page ({final_url})"
             log(msg, "warn")
             if os.path.isfile(out) and os.path.getsize(out) > 2000:
                 return out, msg
@@ -1443,6 +1576,7 @@ def browser_click_renew(
     cookies: list[dict[str, Any]],
     cache_dir: str = ".skycastle-cache",
     server_name: str = "",
+    account: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """On /dashboard/servers: find the RENEWAL block (red area in UI).
 
@@ -1460,10 +1594,10 @@ def browser_click_renew(
 
     try:
         pw, browser, context, page, _ = _playwright_open_servers(
-            panel, cookies, "/dashboard/servers"
+            panel, cookies, "/dashboard/servers", account=account or {}
         )
         try:
-            if "login" in (page.url or "").lower() or "/auth/" in (page.url or "").lower():
+            if _is_login_url(page.url or ""):
                 return {
                     "ok": False,
                     "error": f"browser on login page ({page.url})",
@@ -1710,6 +1844,14 @@ def notify(
                     if item.get("cookies"):
                         jar_cookies = list(item["cookies"])
                         break
+                acc_hint = {
+                    "email": env("SKYCASTLE_EMAIL") or "",
+                    "password": env("SKYCASTLE_PASSWORD") or "",
+                }
+                for item in results:
+                    if item.get("account") and "@" in str(item.get("account")):
+                        acc_hint["email"] = str(item["account"])
+                        break
                 shot, shot_msg = capture_panel_screenshot(
                     panel=panel,
                     remember_token=rtoken,
@@ -1717,6 +1859,7 @@ def notify(
                     path=env("SKYCASTLE_SCREENSHOT_PATH") or "/dashboard/servers",
                     filename="panel-servers.png",
                     cookies=jar_cookies,
+                    account=acc_hint,
                 )
                 if shot:
                     with open(shot, "rb") as fh:
@@ -1838,8 +1981,9 @@ def run_account(account: dict[str, str], mode: str, minutes: int, panel: str, ca
         }
         log(json.dumps(summary["afk_status"], ensure_ascii=False), "info")
 
-    # keep latest token after operations
+    # keep latest token + cookies after operations (browser login may refresh them)
     summary["remember_token"] = client.get_remember_token() or summary.get("remember_token") or ""
+    summary["cookies"] = client.export_cookies_for_browser()
     return summary
 
 
