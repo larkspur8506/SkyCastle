@@ -218,6 +218,47 @@ class PanelClient:
         )
         self.jar.set_cookie(cookie)
 
+    def import_browser_cookies(self, cookies: list[dict[str, Any]]) -> int:
+        """Import cookies from Selenium into urllib jar (restore API session after browser login)."""
+        from http.cookiejar import Cookie
+
+        host = urllib.parse.urlparse(self.base).hostname or "panel.skycastle.us"
+        n = 0
+        for c in cookies or []:
+            name = c.get("name")
+            value = c.get("value")
+            if not name or value is None:
+                continue
+            domain = (c.get("domain") or host).lstrip(".")
+            path = c.get("path") or "/"
+            try:
+                cookie = Cookie(
+                    version=0,
+                    name=str(name),
+                    value=str(value),
+                    port=None,
+                    port_specified=False,
+                    domain=domain,
+                    domain_specified=True,
+                    domain_initial_dot=domain.startswith("."),
+                    path=path,
+                    path_specified=True,
+                    secure=bool(c.get("secure", True)),
+                    expires=int(time.time()) + 60 * 60 * 24 * 30,
+                    discard=False,
+                    comment=None,
+                    comment_url=None,
+                    rest={"HttpOnly": None},
+                    rfc2109=False,
+                )
+                self.jar.set_cookie(cookie)
+                n += 1
+            except Exception:
+                continue
+        if n:
+            log(f"imported {n} browser cookies into API client", "ok")
+        return n
+
     def get_remember_token(self) -> str:
         for c in self.jar:
             if c.name == "remember_token" and c.value:
@@ -1761,7 +1802,8 @@ def browser_click_renew(
 
             _sb_save_shot(sb, before)
 
-            # Find RENEWAL block / button state via JS (matches panel card UI)
+            # Find RENEWAL *action button* only (not the RENEWAL label text).
+            # Real control looks like: "1 credits · in 3h" — if disabled → skip.
             info = {}
             try:
                 info = sb.execute_script(
@@ -1772,19 +1814,20 @@ def browser_click_renew(
                     var buttons = [];
                     var clickable = null;
                     var disabledFound = false;
-                    var nodes = document.querySelectorAll('button, a, [role="button"], div, span');
+                    // ONLY real controls: button / a / role=button
+                    var nodes = document.querySelectorAll('button, a, [role="button"]');
                     for (var i = 0; i < nodes.length; i++) {
                         var b = nodes[i];
                         var text = ((b.innerText || b.textContent || '') + ' ' +
                                     (b.getAttribute('aria-label') || '') + ' ' +
                                     (b.getAttribute('title') || '')).replace(/\\s+/g, ' ').trim();
-                        // skip huge containers
-                        if (text.length > 80) continue;
+                        if (text.length > 60) continue;
                         var low = text.toLowerCase();
-                        var related = low.indexOf('renew') >= 0 || low.indexOf('credit') >= 0 ||
-                                      low.indexOf('续期') >= 0 || low.indexOf('renewal') >= 0 ||
-                                      /\\d+\\s*credits?/.test(low);
-                        if (!related) continue;
+                        // require credits / renew action text — NOT bare "RENEWAL" label
+                        var isAction = /\\d+\\s*credits?/.test(low) ||
+                                       (low.indexOf('renew') >= 0 && low.indexOf('renewal') < 0) ||
+                                       low.indexOf('续期') >= 0;
+                        if (!isAction) continue;
                         var vis = b.offsetParent !== null;
                         var dis = !!b.disabled ||
                                   (b.getAttribute('aria-disabled') || '') === 'true' ||
@@ -1840,21 +1883,28 @@ def browser_click_renew(
 
             log(f"RENEWAL scan: {json.dumps(info, ensure_ascii=False)[:400]}", "info")
 
+            def _browser_cookies():
+                try:
+                    return sb.driver.get_cookies() or []
+                except Exception:
+                    return []
+
             if not info.get("hasRenewal") and not info.get("canClick"):
                 _sb_save_shot(sb, after)
                 return {
                     "ok": True,
                     "skipped": True,
                     "path": "browser:RENEWAL-skip",
-                    "error": "RENEWAL section not found",
+                    "error": "RENEWAL section not found / no renew action",
                     "code": "NO_RENEWAL_UI",
                     "before": before if os.path.isfile(before) else None,
                     "after": after if os.path.isfile(after) else None,
+                    "cookies": _browser_cookies(),
                 }
 
             if not info.get("canClick"):
                 _sb_save_shot(sb, after)
-                reason = "RENEWAL present but not clickable — skip"
+                reason = "RENEWAL present but action button disabled/not clickable — skip"
                 log(reason, "info")
                 return {
                     "ok": True,
@@ -1864,6 +1914,7 @@ def browser_click_renew(
                     "code": "SKIP_NOT_CLICKABLE",
                     "before": before if os.path.isfile(before) else None,
                     "after": after if os.path.isfile(after) else None,
+                    "cookies": _browser_cookies(),
                 }
 
             # click marked element
@@ -1883,7 +1934,8 @@ def browser_click_renew(
                 log(f"renew click JS: {exc}", "warn")
 
             if not clicked:
-                for name in ("Renew", "RENEWAL", "续期", "credit", "Credit"):
+                # only try buttons that look like "N credits" renew action
+                for name in ("credits", "Credits", "续期"):
                     sel = f'button:contains("{name}")'
                     try:
                         if sb.is_element_visible(sel) and sb.is_element_enabled(sel):
@@ -1899,15 +1951,26 @@ def browser_click_renew(
 
             if not clicked:
                 _sb_save_shot(sb, after)
+                # if we only saw disabled credits button, treat as skip not failure
+                if info.get("disabledFound") or info.get("hasRenewal"):
+                    return {
+                        "ok": True,
+                        "skipped": True,
+                        "path": "browser:RENEWAL-skip",
+                        "error": "RENEWAL action not clickable — skip",
+                        "code": "SKIP_NOT_CLICKABLE",
+                        "before": before if os.path.isfile(before) else None,
+                        "after": after if os.path.isfile(after) else None,
+                    }
                 return {
                     "ok": False,
-                    "error": "RENEWAL was marked clickable but click failed",
+                    "error": "RENEWAL action click failed",
                     "code": "CLICK_FAILED",
                     "before": before if os.path.isfile(before) else None,
                     "after": after if os.path.isfile(after) else None,
                 }
 
-            log("clicked RENEWAL on /dashboard/servers", "ok")
+            log("clicked RENEWAL action on /dashboard/servers", "ok")
             time.sleep(2)
             if _sb_challenge_visible(sb):
                 _sb_handle_cloudflare(sb, max_retry=3)
@@ -1928,12 +1991,18 @@ def browser_click_renew(
             time.sleep(2)
             _sb_wait_challenge_gone(sb, timeout=10)
             _sb_save_shot(sb, after)
+            browser_cookies = []
+            try:
+                browser_cookies = sb.driver.get_cookies() or []
+            except Exception:
+                pass
             return {
                 "ok": True,
                 "skipped": False,
                 "path": "browser:RENEWAL",
                 "before": before if os.path.isfile(before) else None,
                 "after": after if os.path.isfile(after) else None,
+                "cookies": browser_cookies,
             }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)[:200], "code": "BROWSER_ERROR"}
@@ -2134,11 +2203,12 @@ def run_account(account: dict[str, str], mode: str, minutes: int, panel: str, ca
     if api_err:
         summary["api_error"] = api_err
 
+    browser_cookies: list[dict[str, Any]] = []
     if mode in {"all", "renew", "status"}:
         if api_ok:
             summary["renew"] = run_renew(client, account)
         else:
-            # browser-only renew when CrowdSec bans GHA API IP
+            # browser-only renew when CrowdSec bans GHA API login
             log("browser-only renew path (no API session)", "warn")
             result = browser_click_renew(
                 panel=panel,
@@ -2147,6 +2217,22 @@ def run_account(account: dict[str, str], mode: str, minutes: int, panel: str, ca
                 server_name="",
                 account=account,
             )
+            browser_cookies = list(result.get("cookies") or [])
+            if browser_cookies:
+                client.import_browser_cookies(browser_cookies)
+                # try API session with browser cookies
+                try:
+                    session = get_session(client)
+                    api_ok = True
+                    summary["api_ok"] = True
+                    summary["remember_token"] = client.get_remember_token() or ""
+                    log(
+                        f"API session restored via browser cookies · "
+                        f"{session.get('username') or session.get('email') or 'user'}",
+                        "ok",
+                    )
+                except ApiError as exc:
+                    log(f"API still blocked after browser cookies: {exc}", "warn")
             summary["renew"] = {
                 "credits_before": None,
                 "credits_after": None,
@@ -2166,6 +2252,15 @@ def run_account(account: dict[str, str], mode: str, minutes: int, panel: str, ca
                 "servers": [],
                 "actions": [f"browser renew: {result.get('path') or result.get('error')}"],
             }
+            # if API restored, refresh credits into report
+            if api_ok:
+                try:
+                    credits = get_credits(client)
+                    summary["renew"]["credits_before"] = credits
+                    summary["renew"]["credits_after"] = credits
+                    summary["renew"]["credits"] = credits
+                except Exception:
+                    pass
 
     if mode in {"all", "afk"}:
         if api_ok:
