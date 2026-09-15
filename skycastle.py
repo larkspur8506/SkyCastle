@@ -1292,26 +1292,42 @@ def _is_login_url(url: str) -> bool:
 
 
 def _sb_challenge_visible(sb: Any) -> bool:
+    """True only for full-page Cloudflare interstitial — NOT the login Turnstile widget."""
     try:
-        src = sb.get_page_source() or ""
-        markers = (
-            "Verify you are human",
-            "Security Verification",
-            "请验证您是真人",
-            "cf-turnstile",
-            "Checking if the site connection is secure",
-            "Just a moment",
+        src = (sb.get_page_source() or "")[:8000]
+        low = src.lower()
+        # Normal login form includes Turnstile text — do not treat as interstitial
+        if 'type="password"' in low or "sign in" in low or "username or email" in low:
+            return (
+                "checking if the site connection is secure" in low
+                or "just a moment" in low
+                or "enable javascript and cookies to continue" in low
+            )
+        return (
+            "checking if the site connection is secure" in low
+            or "just a moment" in low
+            or "enable javascript and cookies to continue" in low
+            or ("verify you are human" in low and "password" not in low)
         )
-        return any(m in src for m in markers)
     except Exception:
         return False
 
 
-def _sb_handle_cloudflare(sb: Any, max_retry: int = 4) -> bool:
-    """Click Cloudflare / Turnstile using SeleniumBase UC GUI helper (like skymc)."""
+def _sb_click_turnstile_once(sb: Any) -> None:
+    """One UC click for the embedded Turnstile checkbox (skymc style)."""
+    try:
+        sb.uc_gui_click_captcha()
+        log("uc_gui_click_captcha (turnstile widget)", "ok")
+        time.sleep(4)
+    except Exception as exc:  # noqa: BLE001
+        log(f"uc_gui_click_captcha: {exc}", "warn")
+
+
+def _sb_handle_cloudflare(sb: Any, max_retry: int = 3) -> bool:
+    """Pass full-page Cloudflare interstitial via UC GUI click."""
     if not _sb_challenge_visible(sb):
         return True
-    log("Cloudflare / Turnstile challenge detected — uc_gui_click_captcha…", "warn")
+    log("Cloudflare interstitial — uc_gui_click_captcha…", "warn")
     for i in range(max_retry):
         log(f"captcha attempt {i + 1}/{max_retry}", "info")
         try:
@@ -1319,16 +1335,16 @@ def _sb_handle_cloudflare(sb: Any, max_retry: int = 4) -> bool:
             log("uc_gui_click_captcha called", "ok")
             time.sleep(5)
             if not _sb_challenge_visible(sb):
-                log("captcha passed", "ok")
+                log("interstitial passed", "ok")
                 return True
         except Exception as exc:  # noqa: BLE001
             log(f"uc_gui_click_captcha: {exc}", "warn")
         time.sleep(2)
-    log("captcha may still be present — continue", "warn")
+    log("interstitial may still be present — continue", "warn")
     return False
 
 
-def _sb_wait_challenge_gone(sb: Any, timeout: int = 20) -> bool:
+def _sb_wait_challenge_gone(sb: Any, timeout: int = 15) -> bool:
     end = time.time() + timeout
     while time.time() < end:
         if not _sb_challenge_visible(sb):
@@ -1452,25 +1468,29 @@ def _sb_browser_login(sb: Any, panel: str, email: str, password: str) -> bool:
     if not _sb_fill_field(sb, pass_sels, password, "password"):
         return False
     time.sleep(1)
-    _sb_handle_cloudflare(sb)
+    # embedded Turnstile checkbox — click once (do NOT loop on widget text)
+    _sb_click_turnstile_once(sb)
     time.sleep(2)
 
-    for attempt in range(5):
+    for attempt in range(4):
         log(f"browser Sign in click #{attempt + 1}", "info")
         _sb_click_login(sb)
-        time.sleep(3)
+        time.sleep(4)
         if _sb_challenge_visible(sb):
-            _sb_handle_cloudflare(sb, max_retry=4)
-            time.sleep(3)
-        for _ in range(12):
+            _sb_handle_cloudflare(sb, max_retry=2)
+            time.sleep(2)
+        for _ in range(10):
             url = (sb.get_current_url() or "").lower()
             if not _is_login_url(url):
                 log(f"browser login ok → {sb.get_current_url()}", "ok")
                 return True
             if _sb_challenge_visible(sb):
-                _sb_handle_cloudflare(sb, max_retry=2)
+                _sb_handle_cloudflare(sb, max_retry=1)
             time.sleep(1)
-        time.sleep(2)
+        # retry turnstile once between sign-in attempts
+        if attempt < 3:
+            _sb_click_turnstile_once(sb)
+            time.sleep(2)
     log(f"browser login failed, url={sb.get_current_url()}", "err")
     return False
 
@@ -1999,27 +2019,80 @@ def run_account(account: dict[str, str], mode: str, minutes: int, panel: str, ca
     who = account.get("email") or "token-account"
     log(f"===== {who} · mode={mode} · panel={panel} =====")
     client = PanelClient(panel, profile="desktop" if mode != "mobile" else "mobile", cache_dir=cache_dir)
-    login(client, account)
+    api_ok = False
+    api_err = ""
+    try:
+        login(client, account)
+        api_ok = True
+    except ApiError as exc:
+        api_err = f"{exc} [{exc.code}]"
+        log(f"API login failed: {api_err}", "err")
+        if exc.code != "WAF_BLOCKED" and mode in {"afk", "mobile", "status"}:
+            # non-WAF auth errors: cannot continue AFK-only modes
+            raise
+        log("API blocked/unavailable — will try browser-only for renew/screenshot", "warn")
+
     summary: dict[str, Any] = {
         "account": who,
         "mode": mode,
         "panel": panel,
         "remember_token": client.get_remember_token() or account.get("token") or "",
-        "cookies": client.export_cookies_for_browser(),
+        "cookies": client.export_cookies_for_browser() if api_ok else [],
+        "api_ok": api_ok,
     }
+    if api_err:
+        summary["api_error"] = api_err
 
     if mode in {"all", "renew", "status"}:
-        summary["renew"] = run_renew(client, account)
+        if api_ok:
+            summary["renew"] = run_renew(client, account)
+        else:
+            # browser-only renew when CrowdSec bans GHA API IP
+            log("browser-only renew path (no API session)", "warn")
+            result = browser_click_renew(
+                panel=panel,
+                cookies=[],
+                cache_dir=cache_dir,
+                server_name="",
+                account=account,
+            )
+            summary["renew"] = {
+                "credits_before": None,
+                "credits_after": None,
+                "credits": None,
+                "renewals": [
+                    {
+                        "name": "browser",
+                        "ok": bool(result.get("ok")),
+                        "skipped": bool(result.get("skipped")),
+                        "path": result.get("path"),
+                        "error": result.get("error"),
+                        "before": result.get("before"),
+                        "after": result.get("after"),
+                    }
+                ],
+                "restarts": [],
+                "servers": [],
+                "actions": [f"browser renew: {result.get('path') or result.get('error')}"],
+            }
 
     if mode in {"all", "afk"}:
-        # all / afk: only desktop AFK, limited to requested minutes (default 10)
-        summary["afk"] = run_afk(client, minutes, "desktop")
+        if api_ok:
+            summary["afk"] = run_afk(client, minutes, "desktop")
+        else:
+            summary["afk"] = {
+                "delta": 0,
+                "error": "skipped: API WAF/CrowdSec blocked (AFK needs API)",
+            }
+            log("AFK skipped — API blocked by WAF/CrowdSec", "warn")
 
     if mode == "mobile":
-        # mobile mode kept for manual use only; not triggered by "all"
-        summary["mobile"] = run_afk(client, minutes, "mobile")
+        if api_ok:
+            summary["mobile"] = run_afk(client, minutes, "mobile")
+        else:
+            summary["mobile"] = {"delta": 0, "error": "API blocked"}
 
-    if mode == "status":
+    if mode == "status" and api_ok:
         st = afk_status(client)
         summary["afk_status"] = {
             "credits": st.get("user_credits"),
@@ -2029,9 +2102,8 @@ def run_account(account: dict[str, str], mode: str, minutes: int, panel: str, ca
         }
         log(json.dumps(summary["afk_status"], ensure_ascii=False), "info")
 
-    # keep latest token + cookies after operations (browser login may refresh them)
     summary["remember_token"] = client.get_remember_token() or summary.get("remember_token") or ""
-    summary["cookies"] = client.export_cookies_for_browser()
+    summary["cookies"] = client.export_cookies_for_browser() if api_ok else summary.get("cookies") or []
     return summary
 
 
