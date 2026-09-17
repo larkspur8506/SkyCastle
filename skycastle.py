@@ -1800,88 +1800,121 @@ def browser_click_renew(
             except Exception as exc:  # noqa: BLE001
                 log(f"prepare servers UI: {exc}", "warn")
 
+            # Scroll RENEWAL / credit button into view before shot + scan
+            try:
+                sb.execute_script(
+                    """
+                    var nodes = document.querySelectorAll('button, a, [role="button"], div');
+                    for (var i = 0; i < nodes.length; i++) {
+                        var t = (nodes[i].innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                        if (/\\d+\\s*credits?/.test(t) || t.indexOf('renewal') >= 0) {
+                            nodes[i].scrollIntoView({block: 'center', behavior: 'instant'});
+                            break;
+                        }
+                    }
+                    """
+                )
+                time.sleep(1)
+            except Exception:
+                pass
+
             _sb_save_shot(sb, before)
 
-            # Find RENEWAL *action button* only (not the RENEWAL label text).
-            # Real control looks like: "1 credits · in 3h" — if disabled → skip.
+            # Find the real renew action: "1 credit · 3 days" / "1 credits · in 3h"
+            # Do NOT treat bare "RENEWAL" label as a button.
+            # Disabled = only disabled attr / aria-disabled / cursor-not-allowed (not "opacity" class).
             info = {}
             try:
                 info = sb.execute_script(
                     """
-                    var serverName = arguments[0] || '';
                     var body = document.body ? document.body.innerText : '';
                     var hasRenewal = body.indexOf('RENEWAL') >= 0 || body.indexOf('续期') >= 0;
                     var buttons = [];
                     var clickable = null;
                     var disabledFound = false;
-                    // ONLY real controls: button / a / role=button
+
+                    function isDisabled(el) {
+                        if (!el) return true;
+                        if (el.disabled) return true;
+                        if ((el.getAttribute('aria-disabled') || '') === 'true') return true;
+                        var cls = (el.className ? String(el.className) : '').toLowerCase();
+                        if (cls.indexOf('cursor-not-allowed') >= 0) return true;
+                        if (cls.indexOf('pointer-events-none') >= 0) return true;
+                        // greyed-out style often uses opacity-50 / opacity-60 alone — check computed
+                        try {
+                            var st = window.getComputedStyle(el);
+                            if (st && st.pointerEvents === 'none') return true;
+                            if (st && parseFloat(st.opacity) < 0.5) return true;
+                        } catch (e) {}
+                        return false;
+                    }
+
+                    function isRenewAction(text) {
+                        var low = (text || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+                        if (!low || low.length > 50) return false;
+                        // "1 credit · 3 days" / "1 credits · in 3h" / "续期"
+                        if (/\\d+\\s*credits?/.test(low)) return true;
+                        if (low.indexOf('续期') >= 0) return true;
+                        // avoid bare "RENEWAL" section title
+                        if (low === 'renewal' || low.indexOf('renewal') === 0 && low.indexOf('credit') < 0)
+                            return false;
+                        if (low.indexOf('renew') >= 0 && low.indexOf('renewal') < 0) return true;
+                        return false;
+                    }
+
+                    // 1) native buttons / links
                     var nodes = document.querySelectorAll('button, a, [role="button"]');
                     for (var i = 0; i < nodes.length; i++) {
                         var b = nodes[i];
-                        var text = ((b.innerText || b.textContent || '') + ' ' +
-                                    (b.getAttribute('aria-label') || '') + ' ' +
-                                    (b.getAttribute('title') || '')).replace(/\\s+/g, ' ').trim();
-                        if (text.length > 60) continue;
-                        var low = text.toLowerCase();
-                        // require credits / renew action text — NOT bare "RENEWAL" label
-                        var isAction = /\\d+\\s*credits?/.test(low) ||
-                                       (low.indexOf('renew') >= 0 && low.indexOf('renewal') < 0) ||
-                                       low.indexOf('续期') >= 0;
-                        if (!isAction) continue;
-                        var vis = b.offsetParent !== null;
-                        var dis = !!b.disabled ||
-                                  (b.getAttribute('aria-disabled') || '') === 'true' ||
-                                  (b.className || '').toLowerCase().indexOf('disabled') >= 0 ||
-                                  (b.className || '').toLowerCase().indexOf('cursor-not-allowed') >= 0;
-                        buttons.push({text: text, disabled: dis, visible: vis});
+                        var text = (b.innerText || b.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (!isRenewAction(text)) continue;
+                        var vis = b.offsetParent !== null || (b.getClientRects && b.getClientRects().length > 0);
+                        var dis = isDisabled(b);
+                        buttons.push({text: text, disabled: dis, visible: !!vis, tag: b.tagName});
                         if (!vis) continue;
                         if (dis) { disabledFound = true; continue; }
                         if (!clickable) clickable = b;
                     }
-                    // also scan near RENEWAL label for a credits bar/button
+
+                    // 2) near RENEWAL label — card row may use styled div as button
                     if (!clickable) {
-                        var labels = Array.prototype.slice.call(document.querySelectorAll('*'))
-                            .filter(function(el) {
-                                var t = (el.childNodes && el.childNodes.length === 1 && el.textContent || '');
-                                return t && (t.indexOf('RENEWAL') >= 0 || t.indexOf('续期') >= 0);
-                            });
-                        for (var j = 0; j < labels.length; j++) {
-                            var row = labels[j].closest('div, section, li, article') || labels[j].parentElement;
-                            if (!row) continue;
-                            var cand = row.querySelectorAll('button, a, [role="button"], div[class*="cursor"]');
-                            for (var k = 0; k < cand.length; k++) {
-                                var el = cand[k];
-                                if (el.offsetParent === null) continue;
-                                var dis2 = !!el.disabled ||
-                                    (el.getAttribute('aria-disabled') || '') === 'true' ||
-                                    (el.className || '').toLowerCase().indexOf('disabled') >= 0 ||
-                                    (el.className || '').toLowerCase().indexOf('opacity') >= 0;
-                                var t2 = (el.innerText || '').toLowerCase();
-                                if (t2.indexOf('credit') >= 0 || t2.indexOf('renew') >= 0 || t2.indexOf('续期') >= 0) {
-                                    if (dis2) { disabledFound = true; continue; }
-                                    clickable = el; break;
-                                }
-                            }
-                            if (clickable) break;
+                        var all = document.querySelectorAll('div, span');
+                        for (var j = 0; j < all.length; j++) {
+                            var el = all[j];
+                            var t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                            // leaf-ish: short text matching credit pattern
+                            if (!isRenewAction(t)) continue;
+                            if (el.children && el.children.length > 3) continue;
+                            var vis2 = el.offsetParent !== null;
+                            var dis2 = isDisabled(el);
+                            buttons.push({text: t, disabled: dis2, visible: !!vis2, tag: el.tagName});
+                            if (!vis2) continue;
+                            if (dis2) { disabledFound = true; continue; }
+                            // prefer clickable parent button if any
+                            var btn = el.closest('button, a, [role="button"]') || el;
+                            if (isDisabled(btn)) { disabledFound = true; continue; }
+                            clickable = btn;
+                            break;
                         }
                     }
+
                     if (clickable) {
+                        try { clickable.scrollIntoView({block:'center'}); } catch (e) {}
                         clickable.setAttribute('data-skycastlereew', '1');
                     }
                     return {
                         hasRenewal: hasRenewal,
                         disabledFound: disabledFound,
                         canClick: !!clickable,
-                        buttons: buttons.slice(0, 12)
+                        buttons: buttons.slice(0, 15)
                     };
-                    """,
-                    server_name or "",
+                    """
                 )
             except Exception as exc:  # noqa: BLE001
                 log(f"renew DOM scan: {exc}", "warn")
                 info = {}
 
-            log(f"RENEWAL scan: {json.dumps(info, ensure_ascii=False)[:400]}", "info")
+            log(f"RENEWAL scan: {json.dumps(info, ensure_ascii=False)[:500]}", "info")
 
             def _browser_cookies():
                 try:
