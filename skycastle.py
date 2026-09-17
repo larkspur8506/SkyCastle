@@ -1034,6 +1034,9 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
                         if data.get(k) is not None:
                             row["renewal_due_after"] = data.get(k)
                             break
+                # browser path may return parsed Due as next_renewal / due_after
+                if result.get("due_after") or result.get("next_renewal"):
+                    row["renewal_due_after"] = result.get("due_after") or result.get("next_renewal")
                 report["renewals"].append(
                     {
                         "name": name,
@@ -1043,8 +1046,11 @@ def run_renew(client: PanelClient, account: dict[str, str]) -> dict[str, Any]:
                         "path": result.get("path"),
                         "due_before": row["renewal_due_before"],
                         "due_after": row["renewal_due_after"],
+                        "next_renewal": row["renewal_due_after"]
+                        or result.get("next_renewal")
+                        or result.get("due_after"),
                         "cost": row["renewal_cost"],
-                        "before": result.get("before"),
+                        "before": None,
                         "after": result.get("after"),
                     }
                 )
@@ -1151,10 +1157,14 @@ def format_report(results: list[dict[str, Any]]) -> str:
             ca = renew.get("credits_after", renew.get("credits"))
             lines.append(f"  Credits: {cb} → {ca}")
             for r in renew.get("renewals") or []:
-                if r.get("ok"):
+                if r.get("ok") and r.get("skipped"):
+                    lines.append(f"  ⏭ 续期 {r.get('name')}: 跳过")
+                elif r.get("ok"):
+                    nxt = r.get("next_renewal") or r.get("due_after") or ""
+                    extra = f" · 预计下次续期 {nxt}" if nxt else ""
                     lines.append(
                         f"  ✅ 续期 {r.get('name')}: due {r.get('due_before')} → {r.get('due_after')} "
-                        f"(cost={r.get('cost')})"
+                        f"(cost={r.get('cost')}){extra}"
                     )
                 else:
                     lines.append(f"  ❌ 续期 {r.get('name')}: {r.get('error')}")
@@ -1222,12 +1232,18 @@ def format_report_html(results: list[dict[str, Any]]) -> str:
                             f"   {_html_escape(str(r.get('error') or 'not clickable'))}"
                         )
                     elif r.get("ok"):
-                        parts.append(
+                        due_b = r.get("due_before") or "-"
+                        due_a = r.get("due_after") or r.get("next_renewal") or "-"
+                        next_est = r.get("next_renewal") or r.get("due_after") or ""
+                        line = (
                             f"✅ <b>{name}</b> 续期成功\n"
-                            f"   Due: <code>{_html_escape(str(r.get('due_before') or '-'))}</code>"
-                            f" → <code>{_html_escape(str(r.get('due_after') or '-'))}</code>\n"
+                            f"   Due: <code>{_html_escape(str(due_b))}</code>"
+                            f" → <code>{_html_escape(str(due_a))}</code>\n"
                             f"   花费: <code>{_html_escape(str(r.get('cost') or '?'))}</code> credits"
                         )
+                        if next_est and str(next_est) not in {"-", "None", ""}:
+                            line += f"\n   📅 预计下次续期: <b>{_html_escape(str(next_est))}</b>"
+                        parts.append(line)
                     else:
                         parts.append(
                             f"❌ <b>{name}</b> 续期失败\n"
@@ -1264,10 +1280,15 @@ def format_report_html(results: list[dict[str, Any]]) -> str:
                 } else "🟡"
                 parts.append(f"{icon} 服务器 <b>{name}</b> · <code>{sb}→{sa}</code>")
                 if srv.get("renewal_due_before") or srv.get("renewal_due_after"):
+                    due_a = srv.get("renewal_due_after") or srv.get("renewal_due_before") or "-"
                     parts.append(
                         f"   Due <code>{_html_escape(str(srv.get('renewal_due_before') or '-'))}</code>"
                         f" → <code>{_html_escape(str(srv.get('renewal_due_after') or '-'))}</code>"
                     )
+                    if srv.get("renewal_due_after"):
+                        parts.append(
+                            f"   📅 预计下次续期: <b>{_html_escape(str(srv.get('renewal_due_after')))}</b>"
+                        )
 
         for key in ("afk", "mobile"):
             block = item.get(key)
@@ -2021,20 +2042,53 @@ def browser_click_renew(
                         break
                 except Exception:
                     continue
-            time.sleep(2)
+            time.sleep(3)
             _sb_wait_challenge_gone(sb, timeout=10)
+            # re-scroll to card and read Due for next renewal estimate
+            next_renewal = ""
+            try:
+                sb.execute_script(
+                    """
+                    var nodes = document.querySelectorAll('button, a, [role="button"], div');
+                    for (var i = 0; i < nodes.length; i++) {
+                        var t = (nodes[i].innerText || '').toLowerCase();
+                        if (t.indexOf('credit') >= 0 || t.indexOf('renewal') >= 0) {
+                            nodes[i].scrollIntoView({block:'center'});
+                            break;
+                        }
+                    }
+                    """
+                )
+                time.sleep(1)
+                next_renewal = sb.execute_script(
+                    """
+                    var body = document.body ? document.body.innerText : '';
+                    // "Due 9月19日" / "Due Sep 19" / "Due 2026-09-19"
+                    var m = body.match(/Due\\s*([\\d月日年月日\\-/]+|\\w+\\s+\\d{1,2})/i);
+                    if (m) return m[1].trim();
+                    m = body.match(/到期[:：]?\\s*([^\\n]+)/);
+                    if (m) return m[1].trim().slice(0, 40);
+                    return '';
+                    """
+                ) or ""
+            except Exception:
+                pass
             _sb_save_shot(sb, after)
             browser_cookies = []
             try:
                 browser_cookies = sb.driver.get_cookies() or []
             except Exception:
                 pass
+            if next_renewal:
+                log(f"next renewal / Due after click: {next_renewal}", "ok")
             return {
                 "ok": True,
                 "skipped": False,
                 "path": "browser:RENEWAL",
-                "before": before if os.path.isfile(before) else None,
+                "before": None,  # only keep success after-shot
                 "after": after if os.path.isfile(after) else None,
+                "next_renewal": next_renewal or None,
+                "due_after": next_renewal or None,
                 "cookies": browser_cookies,
             }
     except Exception as exc:  # noqa: BLE001
@@ -2080,96 +2134,37 @@ def notify(
             except Exception as exc2:  # noqa: BLE001
                 log(f"telegram plain notify failed: {exc2}", "warn")
 
-        # 2) 真实面板截图（dashboard/servers）
+        # 2) 仅续期成功后的截图（不要续期前 / 不要额外整页截图）
         if env("SKYCASTLE_TG_SCREENSHOT", "1") not in {"0", "false", "no"}:
             try:
-                caption = "CastleKeep · panel /dashboard/servers"
-                for item in results:
-                    renew = item.get("renew") or {}
-                    afk = item.get("afk") or {}
-                    ren_ok = sum(1 for r in (renew.get("renewals") or []) if r.get("ok"))
-                    ren_fail = sum(1 for r in (renew.get("renewals") or []) if not r.get("ok"))
-                    rst_ok = sum(1 for r in (renew.get("restarts") or []) if r.get("ok"))
-                    cb = renew.get("credits_before", renew.get("credits", "?"))
-                    ca = renew.get("credits_after", renew.get("credits", "?"))
-                    caption = (
-                        f"Credits {cb}→{ca} · 续期 {ren_ok}ok/{ren_fail}fail · "
-                        f"重启 {rst_ok} · AFK +{afk.get('delta', 0)} · "
-                        f"{time.strftime('%H:%M UTC', time.gmtime())}"
-                    )
-                    break
-
-                rtoken = remember_token or env("SKYCASTLE_TOKEN") or env("SKYCASTLE_REMEMBER_TOKEN")
-                jar_cookies: list[dict[str, Any]] = []
-                for item in results:
-                    if item.get("cookies"):
-                        jar_cookies = list(item["cookies"])
-                        break
-                acc_hint = {
-                    "email": env("SKYCASTLE_EMAIL") or "",
-                    "password": env("SKYCASTLE_PASSWORD") or "",
-                }
-                for item in results:
-                    if item.get("account") and "@" in str(item.get("account")):
-                        acc_hint["email"] = str(item["account"])
-                        break
-                shot, shot_msg = capture_panel_screenshot(
-                    panel=panel,
-                    remember_token=rtoken,
-                    cache_dir=cache_dir,
-                    path=env("SKYCASTLE_SCREENSHOT_PATH") or "/dashboard/servers",
-                    filename="panel-servers.png",
-                    cookies=jar_cookies,
-                    account=acc_hint,
-                )
-                if shot:
-                    with open(shot, "rb") as fh:
-                        png = fh.read()
-                    _tg_api(
-                        token,
-                        "sendPhoto",
-                        {"chat_id": chat, "caption": caption[:900]},
-                        files={"photo": ("panel-servers.png", png)},
-                    )
-                    log("telegram real panel screenshot sent", "ok")
-                else:
-                    try:
-                        _tg_api(
-                            token,
-                            "sendMessage",
-                            {
-                                "chat_id": chat,
-                                "text": f"⚠️ 面板截图失败\n{_html_escape(shot_msg)[:500]}",
-                                "parse_mode": "HTML",
-                                "disable_web_page_preview": "true",
-                            },
-                        )
-                    except Exception:
-                        pass
-                    log(f"real screenshot unavailable: {shot_msg}", "warn")
-
-                # 续期前后截图（浏览器点击 RENEWAL 时生成）
+                sent_any = False
                 for item in results:
                     renew = item.get("renew") or {}
                     for r in renew.get("renewals") or []:
-                        for label, key in (("续期前", "before"), ("续期后", "after")):
-                            p = r.get(key)
-                            if p and os.path.isfile(p):
-                                try:
-                                    with open(p, "rb") as fh:
-                                        data = fh.read()
-                                    _tg_api(
-                                        token,
-                                        "sendPhoto",
-                                        {
-                                            "chat_id": chat,
-                                            "caption": f"{label} · {r.get('name') or ''} · "
-                                            f"{'OK' if r.get('ok') else 'FAIL'}",
-                                        },
-                                        files={"photo": (os.path.basename(p), data)},
-                                    )
-                                except Exception as exc:  # noqa: BLE001
-                                    log(f"tg send {label} shot: {exc}", "warn")
+                        if not (r.get("ok") and not r.get("skipped")):
+                            continue
+                        p = r.get("after")
+                        if not (p and os.path.isfile(p)):
+                            continue
+                        next_est = r.get("next_renewal") or r.get("due_after") or ""
+                        caption = f"✅ 续期成功 · {r.get('name') or ''}"
+                        if next_est:
+                            caption += f" · 预计下次续期 {next_est}"
+                        try:
+                            with open(p, "rb") as fh:
+                                data = fh.read()
+                            _tg_api(
+                                token,
+                                "sendPhoto",
+                                {"chat_id": chat, "caption": caption[:900]},
+                                files={"photo": (os.path.basename(p), data)},
+                            )
+                            sent_any = True
+                            log("telegram renew-success screenshot sent", "ok")
+                        except Exception as exc:  # noqa: BLE001
+                            log(f"tg send renew after shot: {exc}", "warn")
+                if not sent_any:
+                    log("no renew-success screenshot to send", "info")
             except Exception as exc:  # noqa: BLE001
                 log(f"telegram screenshot failed: {exc}", "warn")
 
@@ -2277,8 +2272,12 @@ def run_account(account: dict[str, str], mode: str, minutes: int, panel: str, ca
                         "skipped": bool(result.get("skipped")),
                         "path": result.get("path"),
                         "error": result.get("error"),
-                        "before": result.get("before"),
-                        "after": result.get("after"),
+                        "before": None,
+                        "after": result.get("after")
+                        if (result.get("ok") and not result.get("skipped"))
+                        else None,
+                        "next_renewal": result.get("next_renewal") or result.get("due_after"),
+                        "due_after": result.get("due_after") or result.get("next_renewal"),
                     }
                 ],
                 "restarts": [],
