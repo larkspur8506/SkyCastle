@@ -1,9 +1,9 @@
 name: SkyCastle Renew + AFK
 
 on:
-  schedule:
+  #schedule:
     # Every 6 hours. GitHub cron is UTC.
-    - cron: "20 */6 * * *"
+    #- cron: "20 */6 * * *"
   workflow_dispatch:
     inputs:
       mode:
