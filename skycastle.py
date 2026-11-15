@@ -1604,6 +1604,14 @@ def _sb_browser_login(sb: Any, panel: str, email: str, password: str) -> bool:
     return False
 
 
+def _sb_kwargs() -> dict[str, Any]:
+    """SB 启动参数；IS_PROXY 开启时走本地 sing-box 代理（katabump 同款，绕 CF 对数据中心 IP 的挑战）。"""
+    kw: dict[str, Any] = {"uc": True, "headless": False, "locale_code": "zh-CN"}
+    if (os.environ.get("IS_PROXY", "") or "").strip().lower() in ("1", "true", "yes", "on"):
+        kw["proxy"] = (os.environ.get("PROXY_SERVER", "") or "").strip() or "socks5://127.0.0.1:1080"
+    return kw
+
+
 def _sb_open_servers(
     sb: Any,
     panel: str,
@@ -1735,7 +1743,7 @@ def capture_panel_screenshot(
 
     try:
         # headless=False required for uc_gui_click_captcha (use xvfb on GHA)
-        with SB(uc=True, headless=False, locale_code="zh-CN") as sb:
+        with SB(**_sb_kwargs()) as sb:
             ok = _sb_open_servers(sb, panel, jar, account or {})
             shot = _sb_save_shot(sb, out)
             if not ok:
@@ -1770,7 +1778,12 @@ def browser_click_renew(
     after = os.path.abspath(os.path.join(cache_dir, "renew-after.png"))
 
     try:
-        with SB(uc=True, headless=False, locale_code="zh-CN") as sb:
+        with SB(**_sb_kwargs()) as sb:
+            try:
+                sb.open("https://api.ip.sb/ip")
+                log(f"browser exit IP: {(sb.get_text('body') or '').strip()}", "info")
+            except Exception as exc:  # noqa: BLE001
+                log(f"exit IP probe skipped: {exc}", "warn")
             if not _sb_open_servers(sb, panel, cookies, account or {}):
                 _sb_save_shot(sb, before)
                 return {
