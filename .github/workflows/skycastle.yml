@@ -45,8 +45,23 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq xvfb
           pip install --quiet seleniumbase
-          # download chrome/driver helpers used by seleniumbase
-          seleniumbase get chromedriver || true
+          # chromedriver 与镜像自带 Chrome 严格对齐（2026-11-15：镜像 Chrome=157.0.8103.50，
+          # 而 "Latest Stable" driver=157.0.8103.78，小版本错位导致 Chrome 在 UC 重连时崩溃）
+          CV=$(google-chrome --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+          echo "installed Chrome: $CV"
+          URL=$(curl -s https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json | \
+            CV="$CV" python3 -c "import json,os; v=os.environ['CV']; ms=[x for x in json.load(sys.stdin)['versions'] if x['version']==v]; ds=[u['url'] for u in ms[-1]['downloads'].get('chromedriver',[]) if u['platform']=='linux64'] if ms else []; print(ds[0] if ds else '')")
+          if [ -n "$URL" ]; then
+            wget -qO /tmp/cd.zip "$URL"
+            unzip -o -q /tmp/cd.zip -d /tmp/cd
+            SB_DRIVERS=$(python3 -c "import seleniumbase, os; print(os.path.join(os.path.dirname(seleniumbase.__file__),'drivers'))")
+            cp /tmp/cd/chromedriver-linux64/chromedriver "$SB_DRIVERS/chromedriver"
+            chmod +x "$SB_DRIVERS/chromedriver"
+            echo "chromedriver pinned to $URL"
+          else
+            echo "CfT 无匹配版本，回退 Latest Stable"
+            seleniumbase get chromedriver || true
+          fi
 
       - name: Restore remember_token cache
         uses: actions/cache@v4
