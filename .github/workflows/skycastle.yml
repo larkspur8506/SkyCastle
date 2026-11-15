@@ -71,8 +71,17 @@ jobs:
           restore-keys: |
             skycastle-token-${{ github.repository }}-
 
+      - name: ⚙ 设置代理 (sing-box，绕 CF 对 GitHub IP 的挑战)
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+
       - name: Run CastleKeep
         env:
+          IS_PROXY: "1"
+          PROXY_SERVER: socks5://127.0.0.1:1080
           SKYCASTLE_PANEL: ${{ github.event.inputs.panel || secrets.SKYCASTLE_PANEL || 'https://panel.skycastle.us' }}
           SKYCASTLE_EMAIL: ${{ secrets.SKYCASTLE_EMAIL }}
           SKYCASTLE_USERNAME: ${{ secrets.SKYCASTLE_USERNAME }}
@@ -99,6 +108,15 @@ jobs:
           # uc_gui_click_captcha needs a display
           DISPLAY: ":99"
         run: xvfb-run -a python -u skycastle.py
+
+      - name: 🧽 清理代理与浏览器进程
+        if: always()
+        run: |
+          pkill -f sing-box || true
+          pkill -f chromedriver || true
+          pkill -f chrome || true
+          pkill -f Xvfb || true
+          rm -f sing-box sing-box-config.json sing-box.log
 
       - name: Keep cache even if job failed
         if: always()
